@@ -2,7 +2,7 @@
 name = "pizza-voice-agent"
 version = "0.1.0"
 description = "LangGraph-driven voice agent that places pizza orders via outbound call."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
@@ -51,7 +51,9 @@ convention = "google"
 [tool.pyright]
 include = ["agent", "tests"]
 strict = ["agent"]
-pythonVersion = "3.11"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
