@@ -6,11 +6,11 @@ Guidance for Claude Code when working in this repository.
 
 A voice agent that places an outbound phone call and orders pizza for delivery. Spec: `build_day.md`. Design: `docs/superpowers/specs/2026-04-26-pizza-voice-agent-design.md`.
 
-**Architecture:** hybrid — deterministic Python IVR + OpenAI Realtime API for the human conversation phase. Hand-rolled FastAPI + websockets + SDKs (no Pipecat, no LangGraph). Single Python process per call. Langfuse for observability.
+**Architecture:** custom Pipecat-style audio pipeline (Twilio Media Streams + Deepgram + Silero VAD + Cartesia) bridged via a thin StateProcessor adapter to a **LangGraph** state machine. **gpt-oss-120B on Cerebras** for IVR + HUMAN + extraction LLM calls; **Llama 3.1 8B on Groq** for hold-detection classifier. Single Python process per call. Langfuse for observability. No realtime API — full control over latency and tracing.
 
-**Modes:** `IVR → HOLD → HUMAN → DONE`. Unidirectional transitions only.
+**Modes:** `IVR → HOLD → HUMAN → DONE`. Unidirectional transitions only. Each is a LangGraph node (or pair of nodes for IVR's llm + tool dispatch).
 
-**Speed posture:** this is a one-day build. Optimize for time-to-first-real-call. Parallelize independent work. Use git worktrees for any independent feature stream so multiple chunks can progress simultaneously without branch-switching overhead. Heavyweight review skills are session-end gates, not per-commit gates — see workflow below.
+**Speed posture:** quality-first build, but parallelize where the work is independent. Use git worktrees for independent feature streams so multiple chunks can progress simultaneously without branch-switching overhead. Heavyweight review skills are session-end gates, not per-commit gates — see workflow below.
 
 ## Software best practices
 
@@ -94,13 +94,19 @@ A handler is cancellation-safe iff:
 
 These are the bugs that bite hardest in real-time voice work. Every one is in the design spec; the rules below are non-negotiable.
 
-- **DTMF is out-of-band.** Twilio Media Streams will not deliver DTMF inside the WS audio. Use `twilio.calls(sid).update(send_digits=...)` REST side-channel. **Never** synthesize DTMF tones into the audio stream.
-- **μ-law 8 kHz ↔ PCM16 24 kHz resampling must be exact.** Off-by-one rate mismatch produces chipmunk audio that sounds like a bot — straight to `detected_as_bot`. Use `audioop` or `scipy.signal.resample_poly` and round-trip-test it.
-- **Realtime reconnect is one attempt only.** On WS close mid-call: try once with last ~3 s of transcript prepended as `conversation.item.create role=user`. If reconnect fails, `outcome="disconnect"` and hang up. Don't retry-loop — that masks real failures.
+- **DTMF is out-of-band.** Twilio Media Streams will not deliver DTMF inside the WS audio. Use `twilio.calls(sid).update(twiml=...<Play digits=...>)` REST side-channel. **Never** synthesize DTMF tones into the audio stream. Note: `update(twiml=...)` may interrupt the current `<Connect><Stream>` — verify with a real call. If it does, fall back to scripting DTMF in the initial `/voice` TwiML before the `<Connect>` block.
+- **μ-law 8 kHz ↔ PCM16 resampling must be exact.** Twilio is μ-law 8 kHz. Silero VAD wants PCM16 16 kHz. Cartesia outputs PCM16 (configurable; pick 16 kHz to match VAD or 24 kHz and resample on the way out). Wrong rates produce chipmunk audio that sounds like a bot — straight to `detected_as_bot`. Use `audioop` + `scipy.signal.resample_poly` and round-trip-test it.
+- **Latency floor is endpointing, not the LLM.** Real per-IVR-turn ≈ 1.0–1.3 s wall clock: Deepgram `utterance_end_ms` (~750 ms IVR / ~1500 ms HUMAN) + LLM TTFT (~150 ms on Cerebras for short tool calls; ~150 ms on Groq) + Cartesia first frame (~150 ms). Earlier "650 ms turnaround" estimate was wrong — the endpointing tail dominates. Tune IVR `utterance_end_ms` aggressively (650–800 ms) since prompts are short and responses are forced single-token.
+- **Deepgram does NOT support reconfiguring `utterance_end_ms` mid-connection.** The `Configure` event covers KeepAlive only; endpointing is fixed at `start`. To change it (e.g., IVR→HUMAN), close and reopen the WebSocket. The energy gate in HOLD buffers the ~200–400 ms reopen gap.
+- **Cerebras tool-call message-shape contract.** OpenAI-compatible APIs require: every `AIMessage(tool_calls=[...])` in history must be followed by a matching `ToolMessage(tool_call_id=...)` for each tool call before the next user/assistant turn. The `ivr_tools` node MUST append a synthetic `ToolMessage(content="ok", tool_call_id=call_id)` per tool call, or Cerebras will 400 on the next turn.
+- **Tool-call discipline in IVR.** ivr_llm runs with `tool_choice="required"`. If the model emits ANY content text alongside the tool call, the IVR-tools node must drop the text — only the tool call dispatches. Test on the chosen model (gpt-oss-120B); some models add prefatory tokens even with required-tool-choice.
+- **HUMAN-phase TTS cancellation must use real `Task.cancel()`.** Silero VAD detects user speech during agent TTS; the adapter cancels the in-flight Cartesia streaming task. Boolean flags don't survive a 1 s blocking LLM call. Wrap TTS streaming in `try/finally` so partial μ-law frames don't leak after cancel.
+- **Provider failure modes are different.** Cerebras and Groq both have rate limits + occasional 5xx. Wrap LLM calls with `asyncio.timeout()` (e.g., 5 s) so a hanging provider call can't stall the call. On timeout: in IVR, `outcome="ivr_failed"`; in HUMAN, retry once with cached state, then `outcome="disconnect"`.
 - **ngrok URL changes per restart.** Emit it on boot, log it, validate Twilio webhook reaches it (`/voice` returns 200) **before** placing the call.
 - **`ALLOWED_DESTINATIONS` precheck.** Every `calls.create()` passes through a hard env-var allowlist. Five lines of code; prevents the worst possible bug (calling a real number while developing).
-- **Secret hygiene in logs.** Redact API keys, bearer tokens, and customer phone numbers in the JSON log formatter. Langfuse spans must not capture raw `Authorization` headers. Test the redactor.
-- **Deepgram scope.** Deepgram is used for IVR + hold only. The HUMAN phase uses OpenAI Realtime, which handles its own ASR/TTS — do not double-up.
+- **Secret hygiene in logs.** Redact API keys, bearer tokens, customer phone numbers in the JSON log formatter. Langfuse spans must not capture raw `Authorization` headers. Test the redactor.
+- **Deepgram scope.** Deepgram is used for IVR + HOLD only with `nova-2-phonecall`. HUMAN phase uses Deepgram too, but with longer `utterance_end_ms` (~1500-2000ms) to tolerate employee typing pauses. Different config per mode; don't reuse the same client/options blob.
+- **LangGraph checkpointer thread_id = call_sid.** State must be namespaced per call. If two calls share a thread_id, state collides catastrophically. The adapter MUST set `{"configurable": {"thread_id": call_sid}}` on every `ainvoke`.
 
 ## Testing & verification
 
@@ -183,11 +189,13 @@ This is a single-process voice agent at runtime, but development work splits cle
 
 ## What not to do
 
-- Don't reach for a framework (LangGraph, Pipecat, LiveKit Agents) — design rejected these for this project. Hand-rolled.
+- Don't reach for Pipecat or LiveKit Agents — design uses LangGraph for the state machine and a hand-rolled audio pipeline. Don't conflate "Pipecat-style frames" (a pattern we borrow) with "use Pipecat the library" (we don't).
 - Don't put LLM calls inside the audio frame loop or VAD callback. Latency tanks.
-- Don't conflate IVR DTMF entry with speech (different transports — REST API vs audio).
-- Don't model the whole call as one big LLM prompt. The IVR phase is deterministic; the conversation is open-ended; one model can't serve both.
-- Don't skip observability "for now." Every IVR classification, every state transition, every Realtime tool call goes to JSON logs + Langfuse per the schema above.
+- Don't conflate IVR DTMF entry with speech (different transports — Twilio REST `<Play digits>` vs. Cartesia audio).
+- Don't merge ivr_messages and human_messages. They're separate state lists for a reason; cross-contamination breaks both prompts.
+- Don't run real LLM extraction in `done_node` synchronously inside the audio loop. Run it as an async task that the adapter awaits before printing JSON; bound it with `asyncio.timeout()` so a stuck extraction can't hang exit.
+- Don't skip observability "for now." Every LLM call (ivr_llm, hold_node classifier, human_llm, done_node extraction), every state transition, every tool dispatch goes to JSON logs + Langfuse per the schema above.
 - Don't try to handle every edge case before one end-to-end real-call test. Happy path first, escape hatches second.
-- Don't commit secrets. Twilio/OpenAI/Deepgram/Cartesia/Langfuse keys live in `.env`, which is gitignored.
+- Don't commit secrets. Twilio/Cerebras/Groq/Deepgram/Cartesia/Langfuse keys live in `.env`, which is gitignored.
 - Don't run heavyweight review skills on every commit. They are gates at session boundaries, not per-line linters.
+- Don't share LangGraph state across calls. `thread_id=call_sid` is non-negotiable.
