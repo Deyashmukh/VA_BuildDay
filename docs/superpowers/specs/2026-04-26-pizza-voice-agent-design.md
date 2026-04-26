@@ -12,8 +12,9 @@ Real-time voice work has hard latency floors. Each turn must feel natural (~600�
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Approach | Custom Pipecat-style audio pipeline + LangGraph state machine | Full control over latency, cost, observability. No black-box realtime API. |
-| State machine | LangGraph (`StateGraph` with checkpointer) | Architecture is now node-shaped (per-utterance LLM calls, conditional routing, tool dispatch). Earlier "no LangGraph" decision was tied to the realtime-API design — that constraint is gone. |
+| Audio pipeline | **Pipecat** (the library) | Provides Twilio transport (`FastAPIWebsocketTransport` + `TwilioFrameSerializer`), STT/TTS service processors, VAD analyzer, and a frame-based pipeline runner. Saves ~3 wrappers we'd otherwise hand-roll. Mirrors the team's other voice-agent project. |
+| State machine | **LangGraph** (`StateGraph` with checkpointer) | Architecture is node-shaped (per-utterance LLM calls, conditional routing, tool dispatch). Mirrors the team's other voice-agent project. |
+| Adapter | Custom **`StateMachineProcessor`** (Pipecat `FrameProcessor` subclass) | Receives `TranscriptionFrame`/`UserStartedSpeakingFrame` from upstream Pipecat services; calls `graph.ainvoke()`; emits `TextFrame`/`TTSSpeakFrame`/custom `DTMFFrame` downstream. Three-layer pattern: Pipecat ↔ StateMachineProcessor ↔ LangGraph. |
 | ASR (IVR + HOLD) | Deepgram streaming, μ-law 8 kHz | `nova-2-phonecall` model; `utterance_end_ms` configurable per phase |
 | TTS (IVR + HUMAN) | Cartesia, streaming for HUMAN, buffered for IVR | Streaming for natural HUMAN speech; buffered for tiny IVR utterances |
 | VAD | Silero VAD on inbound audio | Barge-in detection for HUMAN-phase TTS cancellation |
@@ -30,34 +31,42 @@ Real-time voice work has hard latency floors. Each turn must feel natural (~600�
 ```
    Twilio Media Streams (μ-law 8 kHz, 20 ms frames)
                   │
-                  ▼
-   ┌──────────────────────────────────────────┐
-   │  Audio Pipeline (Pipecat-style, hand-rolled)
+                  ▼ FastAPI WS /stream
+   ┌──────────────────────────────────────────────┐
+   │  Pipecat Pipeline (single asyncio task)
    │
-   │   InboundFrame ──┬──► Deepgram ASR ─────► finalized_transcript
-   │                  │
-   │                  └──► Silero VAD ─────► barge_in event
-   │
-   │   OutboundFrame ◄── Cartesia TTS ◄──── tts_text_stream
-   └──────────────────┬───────────────────────┘
-                      │ events: TRANSCRIPT, BARGE_IN, START, STOP
-                      ▼
-   ┌──────────────────────────────────────────┐
-   │  Adapter (StateProcessor)
-   │
-   │   - Receives audio events
-   │   - Owns task interruption: cancel TTS task on barge_in
-   │   - Calls graph.ainvoke({...new_transcript}) per event
-   │   - Routes graph outputs to the audio pipeline:
-   │     • DTMFAction        → Twilio REST <Play digits>
-   │     • SpeakAction (buf) → Cartesia synth → frame queue
-   │     • SpeakAction (str) → Cartesia stream → frame queue
-   │     • EndCallAction     → drain TTS, then Twilio hangup
-   │   - Hold-timeout watchdog (5 min) → mode="done", outcome=HOLD_TIMEOUT
-   └──────────────────┬───────────────────────┘
+   │   FastAPIWebsocketTransport.input  (μ-law)
+   │            │                                 │
+   │            ▼                                 │
+   │   SileroVADAnalyzer  ─► UserStartedSpeakingFrame  ─► barge-in interrupt
+   │            │                                 │
+   │            ▼                                 │
+   │   DeepgramSTTService  ─► TranscriptionFrame  │
+   │            │                                 │
+   │            ▼                                 │
+   │   ┌─────────────────────────────────────┐    │
+   │   │  StateMachineProcessor (custom)     │    │
+   │   │  (Pipecat FrameProcessor subclass)  │    │
+   │   │                                     │    │
+   │   │  - Receives TranscriptionFrame      │    │
+   │   │  - Calls graph.ainvoke(thread_id=   │    │
+   │   │      call_sid, {new_transcript})    │    │
+   │   │  - Emits Pipecat frames downstream: │    │
+   │   │    DTMFFrame (custom)               │    │
+   │   │    TTSSpeakFrame (text)             │    │
+   │   │    EndFrame (terminate)             │    │
+   │   │  - Hold-timeout watchdog (5 min)    │    │
+   │   └────────────┬────────────────────────┘    │
+   │                │                             │
+   │                ▼                             │
+   │   CartesiaTTSService  ─► AudioRawFrame       │
+   │                │                             │
+   │                ▼                             │
+   │   FastAPIWebsocketTransport.output (μ-law)   │
+   └──────────────────┬───────────────────────────┘
                       │ graph.ainvoke(thread_id=call_sid, ...)
                       ▼
-   ┌──────────────────────────────────────────┐
+   ┌──────────────────────────────────────────────┐
    │  LangGraph compiled graph + checkpointer (MemorySaver)
    │
    │      ┌─────── router ───────┐
@@ -324,18 +333,15 @@ For non-`completed` outcomes, fields populate with whatever extraction recovered
 
 ```
 agent/
-├── cli.py                     # entry point
+├── cli.py                     # entry point: load order, boot server, place call
 ├── server.py                  # FastAPI: /start, /voice, ws /stream, /health
-├── adapter.py                 # StateProcessor: bridges audio pipeline ↔ LangGraph
+├── pipeline/
+│   ├── builder.py             # build_pipecat_pipeline(order, graph) → Pipeline
+│   ├── state_machine_processor.py  # FrameProcessor subclass; bridges to LangGraph
+│   ├── dtmf_processor.py      # FrameProcessor that emits DTMF via Twilio REST
+│   └── frames.py              # Custom Pipecat frames (DTMFFrame, etc.)
 ├── audio/
-│   ├── pipeline.py            # frame router, ASR + VAD subscriptions
-│   ├── transport.py           # μ-law 8k ↔ PCM16 16k/24k resampling
-│   ├── vad.py                 # Silero VAD wrapper
-│   ├── tts_buffered.py        # Cartesia synth-then-emit (IVR)
-│   ├── tts_streaming.py       # Cartesia streaming (HUMAN), with cancellation
-│   └── dtmf.py                # Twilio REST sendDigits side-channel
-├── asr/
-│   └── deepgram_stream.py     # Deepgram streaming wrapper
+│   └── transport.py           # μ-law 8k ↔ PCM16 16k/24k resampling helper (used at boundaries)
 ├── graph/
 │   ├── state.py               # AgentState TypedDict + Action union
 │   ├── builder.py             # build_graph() returns compiled graph
@@ -360,8 +366,7 @@ agent/
 │   └── builder.py             # CallResult helpers
 ├── runtime/
 │   ├── tunnel.py              # ngrok
-│   ├── dialer.py              # Twilio dialer with allowlist
-│   └── stream.py              # Twilio Media Streams JSON codec
+│   └── dialer.py              # Twilio dialer with allowlist
 ├── obs/
 │   ├── log.py                 # JSON formatter with redaction
 │   └── langfuse_client.py     # lazy Langfuse setup
@@ -370,6 +375,14 @@ agent/
     ├── order.py               # Order schema (input)
     └── result.py              # CallResult schema (output)
 ```
+
+**Pipecat services we use directly** (no wrapping):
+- `pipecat.transports.network.fastapi_websocket.FastAPIWebsocketTransport`
+- `pipecat.serializers.twilio.TwilioFrameSerializer`
+- `pipecat.audio.vad.silero.SileroVADAnalyzer`
+- `pipecat.services.deepgram.stt.DeepgramSTTService`
+- `pipecat.services.cartesia.tts.CartesiaTTSService`
+- `pipecat.pipeline.pipeline.Pipeline` + `pipecat.pipeline.runner.PipelineRunner` + `pipecat.pipeline.task.PipelineTask`
 
 ## Open Questions / Out-of-Scope for v1
 

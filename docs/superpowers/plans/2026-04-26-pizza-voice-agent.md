@@ -4,19 +4,17 @@
 
 **Goal:** Build a single-process Python voice agent that places an outbound phone call, navigates an automated IVR with LangGraph-driven tool-calling, detects hold→human handoff, conducts a natural conversation through streaming Llama-class LLM + TTS, and emits a structured JSON result via post-call extraction.
 
-**Architecture:** Custom Pipecat-style audio pipeline (Twilio Media Streams → Deepgram ASR + Silero VAD → Cartesia TTS) bridged through a thin StateProcessor adapter to a **LangGraph** state machine with 6 nodes (`router`, `ivr_llm`, `ivr_tools`, `hold_node`, `human_llm`, `done_node`). Per-mode tool registries; mode-specific message histories; `MemorySaver` checkpointer keyed by `thread_id=call_sid`.
+**Architecture:** **Pipecat** (the library) owns the audio pipeline (Twilio transport, Deepgram STT, Silero VAD, Cartesia TTS, frame routing). A custom `StateMachineProcessor` (Pipecat `FrameProcessor` subclass) sits in the pipeline and bridges audio events to a **LangGraph** state machine with 6 nodes (`router`, `ivr_llm`, `ivr_tools`, `hold_node`, `human_llm`, `done_node`). LangGraph runs OUTSIDE the Pipecat pipeline; the processor calls `graph.ainvoke()` per finalized transcript. Per-mode tool registries; mode-specific message histories; `MemorySaver` checkpointer keyed by `thread_id=call_sid`.
 
 **Tech Stack:**
-- Python 3.11+, `asyncio`, FastAPI, `websockets`, `uvicorn`
-- Twilio Python SDK + Media Streams
-- Deepgram streaming ASR (`nova-2-phonecall`)
-- Silero VAD (`silero-vad` PyPI)
-- Cartesia TTS (PCM16 16 kHz output → resample to μ-law 8 kHz)
-- **LangGraph** (latest, Python) + `langgraph-checkpoint` (MemorySaver)
+- Python 3.13+, `asyncio`, FastAPI, `websockets`, `uvicorn`
+- **Pipecat** (`pipecat-ai`, exact version pinned) — provides: `FastAPIWebsocketTransport`, `TwilioFrameSerializer`, `DeepgramSTTService`, `CartesiaTTSService`, `SileroVADAnalyzer`, `Pipeline`, `PipelineRunner`, `PipelineTask`, `FrameProcessor` base class
+- Twilio Python SDK (for outbound dial + DTMF REST sidechannel)
+- **LangGraph** + `langgraph-checkpoint` (MemorySaver)
 - **Cerebras** for `gpt-oss-120B` (ivr_llm, human_llm, done_node extraction)
 - **Groq** for `Llama 3.1 8B` (hold_node binary classifier)
 - LangChain ChatOpenAI-compatible clients (Cerebras exposes OpenAI-compat endpoint; Groq has native LangChain integration)
-- pydantic v2, `audioop` (stdlib), `scipy.signal.resample_poly`
+- pydantic v2, `audioop-lts` (Py 3.13 stdlib drop), `scipy.signal.resample_poly` (used at boundaries — Pipecat handles most resampling internally)
 - pytest, `ruff` (with `D`/pydocstyle), `pyright` (strict)
 - ngrok (`pyngrok`)
 - Langfuse self-hosted (Docker) + LangChain callback
@@ -28,20 +26,20 @@
 
 **Suggested execution mode:** subagent-driven. Phases 0, 2, 3 have parallelizable tasks (independent subsystems). Phases 4–7 are sequential (each builds on the previous mode). Use `superpowers:dispatching-parallel-agents` where independence is real.
 
-## IVR-Only Milestone Scope
+## IVR-Only Milestone Scope (Pipecat-based)
 
-The user's first verification gate is **Phase 4.4 — IVR end-to-end on a real call**. To get there fastest, **execute only the tasks in this list** and skip everything else until that checkpoint passes:
+The user's first verification gate is **Phase 4.4 — IVR end-to-end on a real call**. With Pipecat owning the audio pipeline, the scope is now:
 
 **Required for IVR-end-to-end:**
-- Phase 0: T0.1, T0.2, T0.3, T0.4, T0.5, T0.6 (all)
-- Phase 1: T1.1, T1.2, T1.3, T1.4, T1.5, T1.6, T1.6.5 (added — DTMF mid-stream verification)
-- Phase 2: **T2.1 only** (Deepgram), **T2.3 buffered TTS only**, **T2.4 DTMF**. Skip T2.2 (VAD) and the streaming half of T2.3.
-- Phase 3: T3.1 (state), T3.2 **Cerebras client only** (skip Groq), T3.3 **IVR prompt only** (skip hold/human/extraction prompts), T3.4 **IVR tools only** (skip HUMAN tools), T3.5 (graph builder skeleton with stubbed hold/human/done nodes).
-- Phase 4: T4.1, T4.2, T4.3, T4.3b (added — coded audio-pipeline glue), T4.4.
+- Phase 0: ✅ DONE (T0.1–T0.6 + simplify fixes already on `feat/ivr-e2e`)
+- Phase 1: P1.1 add `pipecat-ai` dep + pin, P1.2 ngrok helper (already-coded conceptually), P1.3 Twilio dialer (allowlist precheck — already-coded conceptually), P1.4 FastAPI server with `/voice` returning Pipecat-compatible TwiML, P1.5 build_pipecat_pipeline skeleton (transport-only — echo via Pipecat's pass-through), P1.6 CLI entrypoint, P1.7 REAL CALL CHECKPOINT 1 (audio echo through Pipecat), P1.8 DTMF mid-stream verify.
+- Phase 2: **T2.1** wire `DeepgramSTTService` into pipeline, **T2.2** wire `CartesiaTTSService` into pipeline, **T2.3** custom `DTMFProcessor` (FrameProcessor that emits Twilio REST DTMF when it sees a `DTMFFrame`). Skip Silero VAD (HUMAN-phase only) and streaming-TTS specifics (already covered by Cartesia service).
+- Phase 3: T3.1 (state + Action types), T3.2 **Cerebras client only**, T3.3 **IVR prompt only**, T3.4 **IVR tools only**, T3.5 (graph builder skeleton with stubbed hold/human/done nodes).
+- Phase 4: T4.1 ivr_llm node (with Prompt-5 deterministic verification), T4.2 ivr_tools node (with `ToolMessage` acks), T4.3 `StateMachineProcessor` (FrameProcessor subclass that bridges to LangGraph), T4.4 wire it into the Pipecat pipeline at the right position, T4.5 REAL CALL CHECKPOINT 2.
 
-**Deferred until after IVR checkpoint passes:** T2.2 (Silero VAD), T2.3 streaming TTS internals, T3.2 Groq client, T3.3 hold/human/extraction prompts, T3.4 HUMAN tools, all of Phases 5/6/7/8/9.
+**Deferred until after IVR checkpoint passes:** Silero VAD wiring (Phase 6), Groq client (Phase 5), hold/human/extraction prompts (Phases 5–7), HUMAN tools (Phase 6), all of Phases 5/6/7/8/9.
 
-This trims ~8–10 tasks of pre-work the IVR doesn't need. After the user confirms IVR works on a real call, resume the plan from Phase 5.
+After the user confirms IVR works on a real call, resume the plan from Phase 5.
 
 ---
 
@@ -801,9 +799,11 @@ git commit -m "feat(obs): JSON logger w/ redaction + lazy Langfuse client + Lang
 
 ---
 
-## Phase 1 — Telephony shell (outbound dial + audio loop sanity)
+## Phase 1 — Pipecat telephony shell (outbound dial + audio echo through Pipecat)
 
-Goal: real outbound call connects, audio frames echo back, clean exit on hangup.
+> **PIPECAT PIVOT NOTE (2026-04-26):** The original Phase 1/2/4 below were written for a hand-rolled audio pipeline. After the pivot to using Pipecat the library, the orchestrator will dispatch updated task content for Phase 1, Phase 2, and Phase 4. Phase 3 (LangGraph foundation) and the IVR-Only Milestone Scope (above) remain authoritative. The old Phase 1/2/4 prose below is preserved for reference but **SUPERSEDED** — do not execute the old hand-rolled tasks; the orchestrator's dispatched task text is the source of truth.
+
+Goal: real outbound call connects, audio frames echo back through Pipecat's pipeline runner, clean exit on hangup.
 
 ### Task 1.1: FastAPI server skeleton (build_app)
 

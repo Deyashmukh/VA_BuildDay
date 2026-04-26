@@ -6,9 +6,9 @@ Guidance for Claude Code when working in this repository.
 
 A voice agent that places an outbound phone call and orders pizza for delivery. Spec: `build_day.md`. Design: `docs/superpowers/specs/2026-04-26-pizza-voice-agent-design.md`.
 
-**Architecture:** custom Pipecat-style audio pipeline (Twilio Media Streams + Deepgram + Silero VAD + Cartesia) bridged via a thin StateProcessor adapter to a **LangGraph** state machine. **gpt-oss-120B on Cerebras** for IVR + HUMAN + extraction LLM calls; **Llama 3.1 8B on Groq** for hold-detection classifier. Single Python process per call. Langfuse for observability. No realtime API — full control over latency and tracing.
+**Architecture:** **Pipecat** (the library) owns the audio pipeline (Twilio transport, Deepgram STT, Silero VAD, Cartesia TTS, frame routing). A custom **`StateMachineProcessor`** (a Pipecat `FrameProcessor` subclass) sits in the pipeline and bridges audio events to the **LangGraph** state machine via `graph.ainvoke()`. **gpt-oss-120B on Cerebras** for IVR + HUMAN + extraction LLM calls; **Llama 3.1 8B on Groq** for hold-detection classifier. Single Python process per call. Langfuse for observability. No realtime API — full control over latency and tracing.
 
-**Modes:** `IVR → HOLD → HUMAN → DONE`. Unidirectional transitions only. Each is a LangGraph node (or pair of nodes for IVR's llm + tool dispatch).
+**Modes:** `IVR → HOLD → HUMAN → DONE`. Unidirectional transitions only. Each is a LangGraph node (or pair of nodes for IVR's llm + tool dispatch). The graph is invoked once per finalized transcript or audio event by the StateMachineProcessor; outbound `Action` results are dispatched as Pipecat frames downstream.
 
 **Speed posture:** quality-first build, but parallelize where the work is independent. Use git worktrees for independent feature streams so multiple chunks can progress simultaneously without branch-switching overhead. Heavyweight review skills are session-end gates, not per-commit gates — see workflow below.
 
@@ -18,7 +18,7 @@ A voice agent that places an outbound phone call and orders pizza for delivery. 
 - **Clear interface boundaries.** Modules communicate through typed dataclasses / pydantic models, never shared mutable globals. Audio frames are bytes; everything else is a typed object.
 - **No silent failures.** Every `except` either re-raises, transitions to a hangup outcome, or logs to Langfuse with full context. Bare `except: pass` is forbidden.
 - **No retries inside the audio loop.** Retries belong at the controller level only. The audio path stays low-latency.
-- **`try/finally` around every long-lived resource** (Realtime session, ngrok tunnel, Twilio call, Deepgram WS). Cancellation must always close the call and emit partial result JSON.
+- **`try/finally` around every long-lived resource** (Pipecat pipeline runner, ngrok tunnel, Twilio call, LLM clients). Cancellation must always tear the pipeline down cleanly and emit partial result JSON.
 - **Use real cancellation (`asyncio.Task.cancel()`), not boolean flags.** See "Cancellation discipline" below for what makes a handler cancellation-safe.
 - **Structured outputs over free-text parsing.** Realtime tool calls record state. Never parse prices/items/totals out of free-form model speech.
 - **Trust framework guarantees at internal boundaries.** Don't add input validation between our own modules. Validate at system boundaries: CLI input, Twilio webhooks, external API responses.
@@ -94,6 +94,8 @@ A handler is cancellation-safe iff:
 
 These are the bugs that bite hardest in real-time voice work. Every one is in the design spec; the rules below are non-negotiable.
 
+- **Pipecat version pinning.** Pipecat is pre-1.0 and breaks weekly. Pin an exact version (`pipecat-ai==<x.y.z>`) and commit `uv.lock`. Don't use ranged constraints (`pipecat-ai>=...`).
+- **Pipecat frame discipline.** All inbound/outbound audio crosses Pipecat's frame boundaries. Don't bypass them with raw socket writes; don't synthesize DTMF as audio frames. Outbound DTMF is a side-channel via Twilio REST, kicked off from the `StateMachineProcessor` (next bullet).
 - **DTMF is out-of-band.** Twilio Media Streams will not deliver DTMF inside the WS audio. Use `twilio.calls(sid).update(twiml=...<Play digits=...>)` REST side-channel. **Never** synthesize DTMF tones into the audio stream. Note: `update(twiml=...)` may interrupt the current `<Connect><Stream>` — verify with a real call. If it does, fall back to scripting DTMF in the initial `/voice` TwiML before the `<Connect>` block.
 - **μ-law 8 kHz ↔ PCM16 resampling must be exact.** Twilio is μ-law 8 kHz. Silero VAD wants PCM16 16 kHz. Cartesia outputs PCM16 (configurable; pick 16 kHz to match VAD or 24 kHz and resample on the way out). Wrong rates produce chipmunk audio that sounds like a bot — straight to `detected_as_bot`. Use `audioop` + `scipy.signal.resample_poly` and round-trip-test it.
 - **Latency floor is endpointing, not the LLM.** Real per-IVR-turn ≈ 1.0–1.3 s wall clock: Deepgram `utterance_end_ms` (~750 ms IVR / ~1500 ms HUMAN) + LLM TTFT (~150 ms on Cerebras for short tool calls; ~150 ms on Groq) + Cartesia first frame (~150 ms). Earlier "650 ms turnaround" estimate was wrong — the endpointing tail dominates. Tune IVR `utterance_end_ms` aggressively (650–800 ms) since prompts are short and responses are forced single-token.
@@ -189,8 +191,9 @@ This is a single-process voice agent at runtime, but development work splits cle
 
 ## What not to do
 
-- Don't reach for Pipecat or LiveKit Agents — design uses LangGraph for the state machine and a hand-rolled audio pipeline. Don't conflate "Pipecat-style frames" (a pattern we borrow) with "use Pipecat the library" (we don't).
-- Don't put LLM calls inside the audio frame loop or VAD callback. Latency tanks.
+- Don't reach for LiveKit Agents — design uses Pipecat for the audio pipeline and LangGraph for the state machine.
+- Don't bypass Pipecat's frame system by calling Twilio/Deepgram/Cartesia clients directly inside graph nodes. Outbound dispatch goes through Pipecat frames pushed downstream by the `StateMachineProcessor`. Inbound audio events arrive as Pipecat frames.
+- Don't put LLM calls inside the audio frame loop or VAD callback. Latency tanks. LLM calls happen inside graph nodes invoked by the `StateMachineProcessor` as a separate task.
 - Don't conflate IVR DTMF entry with speech (different transports — Twilio REST `<Play digits>` vs. Cartesia audio).
 - Don't merge ivr_messages and human_messages. They're separate state lists for a reason; cross-contamination breaks both prompts.
 - Don't run real LLM extraction in `done_node` synchronously inside the audio loop. Run it as an async task that the adapter awaits before printing JSON; bound it with `asyncio.timeout()` so a stuck extraction can't hang exit.
