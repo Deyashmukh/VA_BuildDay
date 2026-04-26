@@ -19,16 +19,3 @@ def get_langfuse() -> Langfuse | None:
     return Langfuse(public_key=public, secret_key=secret, host=host)
 
 
-def langfuse_callback_handler() -> object | None:
-    """Return a LangChain callback handler bound to our Langfuse client.
-
-    Used in LangGraph by passing as a callback to .ainvoke():
-      `await graph.ainvoke(state, config={"callbacks": [langfuse_callback_handler()]})`
-    Auto-traces every LangChain LLM call as a span on the active trace.
-
-    NOTE: returns None for now. The langfuse LangChain integration import path moved
-    between versions (`langfuse.callback` → `langfuse.langchain`) and the new path
-    requires `langchain` (not just `langchain-core`) to be installed. The handler will
-    be wired up in Phase 7 when Langfuse tracing is actually used end-to-end.
-    """
-    return None

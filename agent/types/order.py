@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, StringConstraints, computed_field
+
+PhoneNumber = Annotated[str, StringConstraints(pattern=r"^\d{10}$")]
 
 
 class Pizza(BaseModel):
@@ -38,20 +40,13 @@ class Order(BaseModel):
     """The full order payload received at agent startup."""
 
     customer_name: str
-    phone_number: str
+    phone_number: PhoneNumber
     delivery_address: str
     pizza: Pizza
     side: Side
     drink: Drink
     budget_max: float = Field(gt=0)
     special_instructions: str = ""
-
-    @field_validator("phone_number")
-    @classmethod
-    def _ten_digits(cls, v: str) -> str:
-        if not re.fullmatch(r"\d{10}", v):
-            raise ValueError("phone_number must be exactly 10 digits, no separators")
-        return v
 
     @computed_field  # type: ignore[prop-decorator]
     @property

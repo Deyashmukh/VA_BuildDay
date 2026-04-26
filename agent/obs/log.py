@@ -13,8 +13,18 @@ import logging
 import sys
 from typing import IO
 
-_REDACT_KEYS_FULL = {"api_key", "authorization", "bearer", "auth_token", "secret"}
-_REDACT_KEYS_PHONE = {"to_phone", "from_phone", "phone_number"}
+_REDACT_KEYS_FULL = frozenset({"api_key", "authorization", "bearer", "auth_token", "secret"})
+_REDACT_KEYS_PHONE = frozenset({"to_phone", "from_phone", "phone_number"})
+
+# LogRecord stdlib attributes we never want to surface in the JSON payload.
+# Derived from a fresh LogRecord at module load so this stays in sync with
+# whatever attrs CPython adds (e.g., taskName landed in 3.12).
+_REFERENCE_RECORD = logging.LogRecord(
+    name="", level=0, pathname="", lineno=0, msg="", args=None, exc_info=None,
+)
+_STDLIB_RECORD_ATTRS: frozenset[str] = frozenset(_REFERENCE_RECORD.__dict__) | {
+    "message", "asctime", "taskName",
+}
 
 
 def _redact(payload: dict[str, object]) -> dict[str, object]:
@@ -57,12 +67,7 @@ class _JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
         for key, value in record.__dict__.items():
-            if key in {
-                "args", "asctime", "created", "exc_info", "exc_text", "filename",
-                "funcName", "levelname", "levelno", "lineno", "module", "msecs",
-                "message", "msg", "name", "pathname", "process", "processName",
-                "relativeCreated", "stack_info", "thread", "threadName", "taskName",
-            }:
+            if key in _STDLIB_RECORD_ATTRS:
                 continue
             payload[key] = value
         return json.dumps(_redact(payload), default=str)

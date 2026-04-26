@@ -7,6 +7,7 @@ Use `audioop` + `scipy.signal.resample_poly` and round-trip-test.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from math import gcd
 from typing import cast
 
@@ -42,6 +43,7 @@ def pcm16_to_mulaw8k(pcm: bytes, *, src_rate: int) -> bytes:
     return audioop.lin2ulaw(out.tobytes(), 2)
 
 
+@lru_cache(maxsize=8)
 def _ratio(target: int, source: int) -> tuple[int, int]:
     """Reduce target/source to coprime up/down for resample_poly."""
     g = gcd(target, source)

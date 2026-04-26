@@ -19,5 +19,6 @@ def assert_destination_allowed(to_number: str) -> None:
     allowed = {p.strip() for p in raw.split(",") if p.strip()}
     if to_number not in allowed:
         raise DestinationNotAllowedError(
-            f"{to_number!r} is not in ALLOWED_DESTINATIONS (have: {sorted(allowed)})"
+            f"{to_number!r} is not in ALLOWED_DESTINATIONS "
+            f"(allowlist size: {len(allowed)})"
         )

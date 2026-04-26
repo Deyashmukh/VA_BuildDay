@@ -25,7 +25,7 @@ def test_redaction_masks_phone_digits() -> None:
     logger = build_logger("test_phone", stream=buf)
     logger.info("dial", extra={"to_phone": "+15125550147", "event": "dial"})
     payload = json.loads(buf.getvalue().strip())
-    assert payload["to_phone"] == "+1512***0147"  # digits 4-7 replaced
+    assert payload["to_phone"] == "+1512***0147"  # digits 5-7 of the digit run masked
 
 
 def test_redaction_masks_authorization_header() -> None:
