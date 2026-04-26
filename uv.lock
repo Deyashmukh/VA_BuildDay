@@ -1736,6 +1736,10 @@ deepgram = [
     { name = "deepgram-sdk" },
     { name = "websockets" },
 ]
+websocket = [
+    { name = "fastapi" },
+    { name = "websockets" },
+]
 
 [[package]]
 name = "pizza-voice-agent"
@@ -1753,7 +1757,7 @@ dependencies = [
     { name = "langfuse" },
     { name = "langgraph" },
     { name = "numpy" },
-    { name = "pipecat-ai", extra = ["cartesia", "deepgram"] },
+    { name = "pipecat-ai", extra = ["cartesia", "deepgram", "websocket"] },
     { name = "pydantic" },
     { name = "pyngrok" },
     { name = "python-dotenv" },
@@ -1787,7 +1791,7 @@ requires-dist = [
     { name = "langfuse", specifier = ">=2.36" },
     { name = "langgraph", specifier = ">=0.2" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pipecat-ai", extras = ["cartesia", "deepgram"], specifier = "==0.0.108" },
+    { name = "pipecat-ai", extras = ["cartesia", "deepgram", "silero", "websocket"], specifier = "==0.0.108" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pyngrok", specifier = ">=7.0" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.350" },

@@ -799,62 +799,370 @@ git commit -m "feat(obs): JSON logger w/ redaction + lazy Langfuse client + Lang
 
 ---
 
-## Phase 1 — Pipecat telephony shell (outbound dial + audio echo through Pipecat)
+## Phase 1 — Pipecat telephony shell (Pipecat-revised)
 
-> **PIPECAT PIVOT NOTE (2026-04-26):** The original Phase 1/2/4 below were written for a hand-rolled audio pipeline. After the pivot to using Pipecat the library, the orchestrator will dispatch updated task content for Phase 1, Phase 2, and Phase 4. Phase 3 (LangGraph foundation) and the IVR-Only Milestone Scope (above) remain authoritative. The old Phase 1/2/4 prose below is preserved for reference but **SUPERSEDED** — do not execute the old hand-rolled tasks; the orchestrator's dispatched task text is the source of truth.
+Goal: real outbound call connects, audio frames flow through Pipecat's pipeline runner echoing back to the caller, clean exit on hangup, DTMF mid-stream behavior verified.
 
-Goal: real outbound call connects, audio frames echo back through Pipecat's pipeline runner, clean exit on hangup.
+### Task 1.1: pipecat-ai dependency — DONE
 
-### Task 1.1: FastAPI server skeleton (build_app)
+Already on `feat/ivr-e2e` (commit `669cd42`). Pinned at `pipecat-ai==0.0.108`. Smoke tests cover key import paths.
 
-(Same as old plan Task 1.1 — `/voice` returns TwiML with `<Connect><Stream>`, `/health` returns ok. Tests as in old plan.)
+**One follow-up needed (Task 1.1b):** the senior review flagged the install spec should be `pipecat-ai[cartesia,deepgram,silero,websocket]==0.0.108`. The implementer dropped `silero` thinking it wasn't a declared extra; it actually is (no-op deps in 0.0.108) and including it is future-proofing. Add `[silero,websocket]` via:
 
-### Task 1.2: ngrok tunnel helpers
-
-(Same as old plan Task 1.2 — `open_tunnel`, `close_all_tunnels`.)
-
-### Task 1.3: Twilio dialer with allowlist precheck
-
-(Same as old plan Task 1.3.)
-
-### Task 1.4: Twilio Media Streams JSON codec + WS handler with audio echo
-
-(Same as old plan Task 1.5 — frame decode/encode, /stream WS that echoes audio back as a sanity check. We replace echo with real handlers in Phase 2.)
-
-### Task 1.5: CLI entrypoint
-
-(Same as old plan Task 1.6 — `python -m agent.cli order.json --to <num>`.)
-
-### Task 1.6: REAL CALL CHECKPOINT 1 — outbound dial + audio echo
-
-Manual checkpoint. Place a real call to your own phone; verify audio echoes back; verify clean WS close on hangup; verify `event: "call_placed"` printed on stdout.
-
-### Task 1.6.5: REAL CALL — DTMF mid-stream behavior verification
-
-**Goal:** confirm Twilio's `client.calls(sid).update(twiml=<Response><Play digits="1"/></Response>)` does NOT terminate the active `<Connect><Stream>`. The plan's IVR strategy depends on this; if it terminates the stream, the IVR phase needs a different approach.
-
-- [ ] **Step 1: Place a call as in T1.6, but instrument the WS handler to log every inbound `media` event with a sequence number.**
-
-- [ ] **Step 2: After WS connects and frames are flowing, from a separate terminal run:**
-
-```python
-import os
-from twilio.rest import Client
-sid = "<paste call SID printed at boot>"
-c = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-c.calls(sid).update(twiml='<?xml version="1.0" encoding="UTF-8"?><Response><Play digits="1"/></Response>')
+```bash
+source .venv/bin/activate
+uv add 'pipecat-ai[cartesia,deepgram,silero,websocket]==0.0.108'
+git add pyproject.toml uv.lock
+git commit -m "chore(deps): pipecat-ai add silero+websocket extras for future-proofing"
 ```
 
-- [ ] **Step 3: Observe.**
+### Task 1.2: Project-local Pipecat frames
 
-Expected (the happy path the plan assumes): the call hears DTMF tones, the WS keeps receiving `media` events, sequence numbers continue uninterrupted.
+**Files:** `agent/pipeline/__init__.py`, `agent/pipeline/frames.py`, `tests/test_frames.py`
 
-If the WS receives a `stop` event and never resumes: the `update(twiml=...)` mechanism terminates `<Connect><Stream>`. **Plan needs revision** — see fallback in Task 2.4 caveats; consider `<Play digits>` followed by re-`<Connect><Stream>` to the same URL, accepting a brief audio gap.
+We define a `RestDTMFFrame(SystemFrame)` that signals "send these DTMF digits via Twilio REST." We **do not** use Pipecat's `OutputDTMFFrame` because on `FastAPIWebsocketTransport` it falls back to synthesizing μ-law tones into the audio stream — exactly the foot-gun CLAUDE.md forbids.
 
-- [ ] **Step 4: Document the result inline in `docs/superpowers/dtmf-mid-stream-result.md`** with the call SID and the observed behavior. Future debugging will reference this.
+```python
+"""Project-local Pipecat frames."""
 
-- [ ] **Step 5: Commit findings.**
+from __future__ import annotations
 
+from dataclasses import dataclass
+
+from pipecat.frames.frames import SystemFrame
+
+
+@dataclass
+class RestDTMFFrame(SystemFrame):
+    """Send DTMF digits via Twilio REST sidechannel — not via audio synthesis.
+
+    Consumed by `DTMFProcessor` (Phase 2) which calls Twilio's `<Play digits>`
+    update API. Never confuse with `pipecat.frames.frames.OutputDTMFFrame`,
+    which on FastAPIWebsocketTransport synthesizes tones into audio (see
+    CLAUDE.md foot-guns).
+    """
+
+    digits: str = ""
+```
+
+Test: import and instantiate; assert digits round-trip.
+
+Commit: `feat(pipeline): RestDTMFFrame for out-of-band DTMF via Twilio REST`.
+
+### Task 1.3: ngrok tunnel helpers
+
+**Files:** `agent/runtime/__init__.py`, `agent/runtime/tunnel.py`
+
+```python
+"""ngrok tunnel boot/teardown helpers."""
+
+from __future__ import annotations
+
+import os
+
+from pyngrok import conf, ngrok
+
+
+def open_tunnel(port: int) -> str:
+    """Open an ngrok HTTPS tunnel to localhost:port; return the public URL."""
+    auth = os.environ.get("NGROK_AUTHTOKEN")
+    if auth:
+        conf.get_default().auth_token = auth
+    tunnel = ngrok.connect(port, "http", bind_tls=True)
+    return str(tunnel.public_url)
+
+
+def close_all_tunnels() -> None:
+    """Close every active ngrok tunnel."""
+    ngrok.kill()
+```
+
+No unit tests (network side-effect; covered by Task 1.8 real call).
+
+Commit: `feat(runtime): ngrok tunnel open/close helpers`.
+
+### Task 1.4: Twilio dialer with allowlist precheck
+
+**Files:** `agent/runtime/dialer.py`, `tests/test_dialer.py`
+
+```python
+"""Twilio outbound dialer with hard ALLOWED_DESTINATIONS precheck."""
+
+from __future__ import annotations
+
+from twilio.rest import Client
+
+from agent.safety import assert_destination_allowed
+
+
+def place_call(client: Client, *, to: str, from_: str, voice_url: str) -> str:
+    """Place an outbound call. Returns the Twilio call SID.
+
+    The destination is hard-checked against ALLOWED_DESTINATIONS BEFORE any
+    network call; the SDK is never invoked for a blocked number.
+    """
+    assert_destination_allowed(to)
+    call = client.calls.create(to=to, from_=from_, url=voice_url, record=False)
+    return str(call.sid)
+```
+
+Tests (mock the SDK): allowlist blocks → no SDK call; allowed → SDK called with right args; SID returned.
+
+Commit: `feat(runtime): Twilio outbound dialer with hard allowlist precheck`.
+
+### Task 1.5: FastAPI server with /voice + /start + /stream
+
+**Files:** `agent/server.py`, `tests/test_server.py`
+
+```python
+"""FastAPI app: /start (place call), /voice (Twilio webhook), /stream (Pipecat WS), /health."""
+
+from __future__ import annotations
+
+import os
+
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import PlainTextResponse
+
+
+def build_app(public_url: str | None = None) -> FastAPI:
+    """Construct the FastAPI app. /stream WS handler is wired in Task 1.6."""
+    app = FastAPI()
+    base = public_url or os.environ.get("PUBLIC_URL", "wss://localhost:8000")
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/voice")
+    async def voice(_: Request) -> PlainTextResponse:
+        ws_url = base.replace("https://", "wss://").replace("http://", "ws://") + "/stream"
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            f'<Connect><Stream url="{ws_url}"/></Connect>'
+            "</Response>"
+        )
+        return PlainTextResponse(twiml, media_type="application/xml")
+
+    @app.websocket("/stream")
+    async def stream(websocket: WebSocket) -> None:
+        # Wired in Task 1.6 — runs build_pipecat_pipeline.
+        from agent.pipeline.builder import run_pipeline_for_call
+        await run_pipeline_for_call(websocket, app)
+
+    return app
+```
+
+Test: `/voice` returns TwiML with `<Connect><Stream>`, `/health` returns ok.
+
+Commit: `feat(server): FastAPI with /voice TwiML, /health, /stream WS wired to Pipecat`.
+
+### Task 1.6: build_pipecat_pipeline skeleton (transport-only echo)
+
+**Files:** `agent/pipeline/builder.py`
+
+This is the core of the Pipecat integration. Build a `Pipeline` with just the transport (input + output) so audio echoes back. We expand to STT + TTS + StateMachineProcessor in Phase 2 + Phase 4.
+
+Use the canonical 0.0.108 paths verified in T1.1:
+- `pipecat.transports.websocket.fastapi.FastAPIWebsocketTransport`
+- `pipecat.serializers.twilio.TwilioFrameSerializer`
+- `pipecat.pipeline.pipeline.Pipeline`
+- `pipecat.pipeline.runner.PipelineRunner`
+- `pipecat.pipeline.task.PipelineTask`
+
+```python
+"""Build and run the Pipecat pipeline for one call."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI, WebSocket
+
+
+async def run_pipeline_for_call(websocket: WebSocket, app: FastAPI) -> None:
+    """Run the Pipecat pipeline for one call. Returns when call hangs up.
+
+    Reads `app.state.twilio_account_sid`, `app.state.twilio_auth_token`,
+    `app.state.order` set by the CLI before serving.
+    """
+    # 1. Wait for Twilio's `start` event so we have stream_sid + call_sid
+    start_data = await websocket.receive_json()
+    while start_data.get("event") != "start":
+        start_data = await websocket.receive_json()
+    stream_sid = start_data["start"]["streamSid"]
+    call_sid = start_data["start"]["callSid"]
+
+    serializer = TwilioFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        account_sid=app.state.twilio_account_sid,
+        auth_token=app.state.twilio_auth_token,
+    )
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            vad_analyzer=SileroVADAnalyzer(),  # used for barge-in in Phase 6; harmless here
+            serializer=serializer,
+        ),
+    )
+
+    # Phase 1: echo only — input → output.
+    # Phase 2 will insert: transport.input() → STT → ... → TTS → transport.output()
+    pipeline = Pipeline([transport.input(), transport.output()])
+
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    runner = PipelineRunner(handle_sigint=False)
+
+    try:
+        await runner.run(task)
+    finally:
+        # Pipecat's PipelineTask handles its own teardown on hangup; this is
+        # belt-and-suspenders in case of exceptions.
+        await task.cancel()
+```
+
+> **Lifecycle note (per senior review gap):** `PipelineRunner.run(task)` returns when the pipeline ends (call hangup signaled by transport). The `try/finally` ensures `task.cancel()` runs on any exception; Pipecat's runner handles SIGINT separately (`handle_sigint=False` because we manage our own).
+
+> **`call_sid` plumbing (per senior review gap):** the `start` event carries `call_sid`. We extract it before pipeline creation and use it as both `TwilioFrameSerializer`'s `call_sid` AND (in Phase 4) the LangGraph `thread_id`. The `StateMachineProcessor` will read it from app.state set by the pipeline builder.
+
+Commit: `feat(pipeline): build_pipecat_pipeline skeleton with transport-only echo`.
+
+### Task 1.7: CLI entrypoint
+
+**Files:** `agent/cli.py`, `agent/__main__.py`
+
+```python
+"""CLI: load order, boot server, open ngrok, place call, exit when call ends."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+
+import uvicorn
+from dotenv import load_dotenv
+from twilio.rest import Client
+
+from agent.runtime.dialer import place_call
+from agent.runtime.tunnel import close_all_tunnels, open_tunnel
+from agent.safety import assert_destination_allowed
+from agent.server import build_app
+from agent.types import Order
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="agent")
+    p.add_argument("order_file", type=Path, help="Path to order JSON")
+    p.add_argument("--to", required=True, help="Destination phone number, E.164 (+1...)")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Returns process exit code."""
+    load_dotenv()
+    args = _parse_args(argv or sys.argv[1:])
+
+    order = Order.model_validate(json.loads(args.order_file.read_text()))
+    assert_destination_allowed(args.to)
+
+    port = int(os.environ.get("PORT", 8000))
+    public_url = open_tunnel(port)
+
+    app = build_app(public_url=public_url)
+    app.state.twilio_account_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    app.state.twilio_auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+    app.state.order = order
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    server_thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    server_thread.start()
+
+    try:
+        client = Client(app.state.twilio_account_sid, app.state.twilio_auth_token)
+        sid = place_call(
+            client, to=args.to, from_=os.environ["TWILIO_FROM_NUMBER"],
+            voice_url=f"{public_url}/voice",
+        )
+        print(json.dumps({"event": "call_placed", "call_sid": sid, "order": order.customer_name}))
+
+        while server_thread.is_alive():
+            server_thread.join(timeout=1)
+    finally:
+        close_all_tunnels()
+
+    return 0
+```
+
+`agent/__main__.py`:
+```python
+"""Module entrypoint: `python -m agent.cli ...`."""
+
+from agent.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Commit: `feat(cli): order.json + --to entry point that boots server, ngrok, places call`.
+
+### Task 1.8: REAL CALL CHECKPOINT 1 — Pipecat echo
+
+Manual checkpoint:
+
+1. Configure `.env` with real Twilio + ngrok auth.
+2. Set `ALLOWED_DESTINATIONS` to your own phone in E.164.
+3. Run: `python -m agent.cli fixtures/orders/example.json --to +1YOURPHONE`
+4. Pick up your phone; speak; verify you hear yourself echoed back.
+5. Hang up; verify the Python process exits cleanly with no exceptions.
+
+If audio is chipmunked, the `TwilioFrameSerializer` is misconfigured — re-check `stream_sid`/`call_sid` are pulled from the `start` event.
+
+If WS connects but no audio: the pipeline isn't routing transport.input() → transport.output(); check `audio_in_enabled` and `audio_out_enabled` in `FastAPIWebsocketParams`.
+
+Commit any fixes before Task 1.9.
+
+### Task 1.9: REAL CALL — DTMF mid-stream behavior verification
+
+Confirms Twilio's `update(twiml=<Play digits>)` REST call does NOT terminate the active `<Connect><Stream>`. Our IVR strategy depends on this; if it terminates the stream, we need a fallback.
+
+1. Place a call as in Task 1.8.
+2. While audio is flowing, from a separate terminal:
+   ```python
+   import os
+   from twilio.rest import Client
+   sid = "<paste call_placed SID>"
+   c = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+   c.calls(sid).update(twiml='<?xml version="1.0"?><Response><Play digits="1"/></Response>')
+   ```
+3. Verify: the call hears DTMF tones; the WS keeps receiving `media` events.
+
+If the WS disconnects (`stop` event fires and never resumes): document the failure in `docs/superpowers/dtmf-mid-stream-result.md` and consider the fallback (re-`<Connect><Stream>` after `<Play digits>`).
+
+Commit findings either way:
 ```bash
 git add docs/superpowers/dtmf-mid-stream-result.md
 git commit -m "docs: record DTMF mid-stream Twilio behavior observation"
@@ -862,434 +1170,146 @@ git commit -m "docs: record DTMF mid-stream Twilio behavior observation"
 
 ---
 
-## Phase 2 — Audio pipeline (ASR + VAD + TTS)
+## Phase 2 — Pipecat services + custom DTMFProcessor
 
-Goal: audio frames flow through Deepgram (text out), Silero VAD (barge-in signal), and Cartesia (audio in two modes — buffered for IVR, streaming for HUMAN with cancellation).
+Goal: extend the transport-only echo from Phase 1 with Pipecat's prebuilt `DeepgramSTTService` and `CartesiaTTSService`, plus a custom `DTMFProcessor` that consumes our project-local `RestDTMFFrame`.
 
-These tasks are independent of each other and can run in parallel via `superpowers:dispatching-parallel-agents`. Each task is self-contained and tested in isolation; the integration in Phase 3+ wires them through the StateProcessor adapter.
+These three tasks are largely independent (each adds one processor to the pipeline). Run sequentially — they all modify `agent/pipeline/builder.py` so worktrees would conflict on the merge.
 
-### Task 2.1: Deepgram streaming ASR wrapper
+### Task 2.1: Wire `DeepgramSTTService` into the pipeline
 
 **Files:**
-- Create: `agent/asr/__init__.py`, `agent/asr/deepgram_stream.py`
+- Modify: `agent/pipeline/builder.py`
 
-**Important correction from senior review:** Deepgram's live transcription does NOT support reconfiguring `utterance_end_ms` mid-connection (the `Configure` event covers KeepAlive and a small set of params; endpointing is fixed at connect). To switch endpointing on mode transitions, **close and reopen** the WebSocket. The wrapper exposes only `open(utterance_end_ms=...)` and `close()`; the adapter handles the close+reopen at HOLD→HUMAN. The energy gate buffers the ~200–400 ms gap during reopen.
-
-- [ ] **Step 1: Implement `agent/asr/deepgram_stream.py`**
+Pipecat owns the WS lifecycle and audio frame routing — we just instantiate the service and put it in the `Pipeline` list.
 
 ```python
-"""Deepgram streaming ASR wrapper. Feeds μ-law 8 kHz, yields finalized transcripts."""
-
-from __future__ import annotations
-
-import asyncio
+# In agent/pipeline/builder.py
 import os
-from collections.abc import AsyncIterator
+from pipecat.services.deepgram.stt import DeepgramSTTService
 
-from deepgram import (
-    DeepgramClient,
-    DeepgramClientOptions,
-    LiveOptions,
-    LiveTranscriptionEvents,
+# Inside run_pipeline_for_call, after `transport = ...`:
+stt = DeepgramSTTService(
+    api_key=os.environ["DEEPGRAM_API_KEY"],
+    model="nova-2-phonecall",
+    # Note: utterance_end_ms is fixed at connect (per senior review).
+    # Mode-specific endpointing (IVR=750ms vs HUMAN=1500ms) requires
+    # closing+reopening the service in Phase 5/6, not configurable here.
+    sample_rate=8000,  # μ-law from Twilio
 )
 
-
-class DeepgramStream:
-    """Async wrapper around Deepgram's live transcription WS.
-
-    Use `open()` to start, `send(mulaw)` for each inbound frame, `finals()` to
-    iterate finalized transcripts, `errors()` for fatal errors, `close()` on shutdown.
-    """
-
-    def __init__(self) -> None:
-        config = DeepgramClientOptions(options={"keepalive": "true"})
-        self._client = DeepgramClient(os.environ["DEEPGRAM_API_KEY"], config)
-        self._connection: object | None = None
-        self._final_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._error_queue: asyncio.Queue[Exception] = asyncio.Queue()
-
-    async def open(self, *, utterance_end_ms: int = 1000) -> None:
-        """Open the live transcription connection with the given endpointing."""
-        connection = self._client.listen.asynclive.v("1")
-
-        async def _on_transcript(_self: object, result: object, **_: object) -> None:
-            data = getattr(result, "channel", None)
-            if not data:
-                return
-            alts = getattr(data, "alternatives", []) or []
-            if not alts:
-                return
-            transcript = alts[0].transcript or ""
-            is_final = bool(getattr(result, "is_final", False))
-            if is_final and transcript.strip():
-                await self._final_queue.put(transcript)
-
-        async def _on_error(_self: object, error: object, **_: object) -> None:
-            await self._error_queue.put(RuntimeError(f"deepgram error: {error}"))
-
-        connection.on(LiveTranscriptionEvents.Transcript, _on_transcript)
-        connection.on(LiveTranscriptionEvents.Error, _on_error)
-
-        options = LiveOptions(
-            encoding="mulaw",
-            sample_rate=8000,
-            channels=1,
-            language="en-US",
-            model="nova-2-phonecall",
-            interim_results=False,
-            utterance_end_ms=str(utterance_end_ms),
-            vad_events=False,  # we use Silero VAD instead (HUMAN phase only)
-            smart_format=True,
-        )
-        await connection.start(options)
-        self._connection = connection
-
-    async def send(self, mulaw: bytes) -> None:
-        """Stream a μ-law audio frame to Deepgram."""
-        if self._connection is None:
-            raise RuntimeError("DeepgramStream not opened")
-        await self._connection.send(mulaw)  # type: ignore[attr-defined]
-
-    async def finals(self) -> AsyncIterator[str]:
-        """Yield finalized utterance transcripts as they arrive."""
-        while True:
-            yield await self._final_queue.get()
-
-    async def errors(self) -> AsyncIterator[Exception]:
-        """Yield fatal errors as they arrive."""
-        while True:
-            yield await self._error_queue.get()
-
-    async def close(self) -> None:
-        """Close the live transcription connection."""
-        if self._connection is not None:
-            await self._connection.finish()  # type: ignore[attr-defined]
-            self._connection = None
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    transport.output(),  # echo TTS removed — STT is silent on the output side
+])
 ```
 
-- [ ] **Step 2: Commit**
+> **Deepgram reopen note (per senior review gap):** Pipecat's `DeepgramSTTService` is constructed once per pipeline. To swap endpointing at IVR→HOLD→HUMAN transitions, we'll need to call its internal reconnect logic OR rebuild the pipeline mid-call. For now (Phase 2 + IVR-only milestone), pick `utterance_end_ms=750` (IVR-tuned per CLAUDE.md latency math); HUMAN-phase tuning lands in Phase 6. Document the reopen mechanism choice when Phase 5 ships.
 
-```bash
-ruff check agent && pyright
-git add agent/asr/
-git commit -m "feat(asr): Deepgram streaming wrapper with configurable endpointing"
-```
+Test: smoke import only (real verification is Phase 4 real call). Commit: `feat(pipeline): wire DeepgramSTTService for IVR transcripts`.
 
----
-
-### Task 2.2: Silero VAD wrapper for barge-in detection
+### Task 2.2: Wire `CartesiaTTSService` into the pipeline
 
 **Files:**
-- Create: `agent/audio/vad.py`
-- Create: `tests/test_vad.py`
+- Modify: `agent/pipeline/builder.py`
 
-- [ ] **Step 1: Write failing tests**
+Similar shape. Cartesia consumes `TTSSpeakFrame`/`TextFrame` upstream and emits audio frames downstream. Pipecat handles the rate conversion automatically (Cartesia → μ-law 8 kHz for Twilio).
 
 ```python
-"""Tests for Silero VAD wrapper."""
+# Add to run_pipeline_for_call:
+from pipecat.services.cartesia.tts import CartesiaTTSService
 
-from __future__ import annotations
+tts = CartesiaTTSService(
+    api_key=os.environ["CARTESIA_API_KEY"],
+    voice_id=os.environ["CARTESIA_VOICE_ID"],
+    sample_rate=8000,  # output to μ-law 8 kHz for Twilio
+)
 
-import math
-
-import numpy as np
-
-from agent.audio.vad import SileroVAD
-
-
-def _silence_pcm16_16k(ms: int) -> bytes:
-    return np.zeros(int(16_000 * ms / 1000), dtype=np.int16).tobytes()
-
-
-def _voice_like_pcm16_16k(ms: int, freq: float = 200.0) -> bytes:
-    t = np.linspace(0, ms / 1000, int(16_000 * ms / 1000), endpoint=False)
-    return (np.sin(2 * math.pi * freq * t) * 0.7 * 32767).astype(np.int16).tobytes()
-
-
-def test_silence_does_not_fire() -> None:
-    vad = SileroVAD()
-    fired = False
-    for _ in range(20):  # 600 ms of silence (30 ms windows)
-        if vad.is_speech_chunk(_silence_pcm16_16k(30)):
-            fired = True
-    assert not fired
-
-
-def test_voice_like_eventually_fires() -> None:
-    vad = SileroVAD()
-    fired = False
-    for _ in range(20):
-        if vad.is_speech_chunk(_voice_like_pcm16_16k(30)):
-            fired = True
-            break
-    # Note: a pure sine tone may or may not classify as speech;
-    # this test is loose. Real voice should reliably fire.
-    # Document this as a smoke test; real coverage is in real-call testing.
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    # StateMachineProcessor lands here in Phase 4
+    tts,
+    transport.output(),
+])
 ```
 
-(VAD is statistical; tight unit testing is hard. The smoke test gates the wrapper API.)
+For now, no upstream produces `TTSSpeakFrame`s — this is a stub until Phase 4. The pipeline still runs; STT just transcribes silently. We're proving the wiring.
 
-- [ ] **Step 2: Implement `agent/audio/vad.py`**
+Commit: `feat(pipeline): wire CartesiaTTSService into the pipeline`.
+
+### Task 2.3: Custom `DTMFProcessor` (consumes `RestDTMFFrame` → Twilio REST)
+
+**Files:**
+- Create: `agent/pipeline/dtmf_processor.py`
+- Create: `tests/test_dtmf_processor.py`
+
+This is the foot-gun avoidance: instead of synthesizing DTMF audio, this processor receives `RestDTMFFrame` (defined in Phase 1.2) and calls Twilio's `<Play digits>` REST sidechannel.
 
 ```python
-"""Silero VAD wrapper. Consumes PCM16 16 kHz frames; signals voice activity."""
+"""DTMFProcessor: consumes RestDTMFFrame, sends DTMF via Twilio REST sidechannel."""
 
 from __future__ import annotations
 
-import numpy as np
-import torch
-from silero_vad import load_silero_vad
+from typing import TYPE_CHECKING
+
+from pipecat.frames.frames import Frame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+from agent.pipeline.frames import RestDTMFFrame
+
+if TYPE_CHECKING:
+    from twilio.rest import Client
 
 
-class SileroVAD:
-    """Frame-by-frame voice activity detector.
+class DTMFProcessor(FrameProcessor):
+    """Send DTMF digits via Twilio REST when a RestDTMFFrame flows through.
 
-    Silero VAD operates on 30 ms PCM16 16 kHz frames (480 samples). Returns a
-    probability per frame; we threshold at 0.5 by default. Stateful — keep one
-    instance per audio stream.
+    The frame is consumed (not pushed downstream) since DTMF doesn't traverse
+    the audio path. Other frame types pass through unchanged.
     """
 
-    _CHUNK_SAMPLES = 480  # 30 ms at 16 kHz
-    _THRESHOLD = 0.5
+    def __init__(self, twilio_client: Client, call_sid: str) -> None:
+        super().__init__()
+        self._twilio = twilio_client
+        self._call_sid = call_sid
 
-    def __init__(self) -> None:
-        self._model = load_silero_vad()
-
-    def is_speech_chunk(self, pcm16_16k: bytes) -> bool:
-        """Return True if this 30 ms PCM16 16 kHz chunk contains voice activity."""
-        if len(pcm16_16k) != self._CHUNK_SAMPLES * 2:
-            raise ValueError(
-                f"expected {self._CHUNK_SAMPLES * 2} bytes (30 ms PCM16 16k), got {len(pcm16_16k)}"
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Intercept RestDTMFFrame; pass everything else through."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, RestDTMFFrame):
+            twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<Response><Play digits="{frame.digits}"/></Response>'
             )
-        arr = np.frombuffer(pcm16_16k, dtype=np.int16).astype(np.float32) / 32768.0
-        tensor = torch.from_numpy(arr)
-        prob = float(self._model(tensor, 16_000).item())
-        return prob > self._THRESHOLD
+            self._twilio.calls(self._call_sid).update(twiml=twiml)
+            # consumed — do not push downstream
+            return
+        await self.push_frame(frame, direction)
 ```
 
-- [ ] **Step 3: Commit**
+Tests (mock Twilio client + mock parent.push_frame): `RestDTMFFrame` → REST update called, NOT pushed downstream. Other frames → pushed unchanged, REST not called.
 
-```bash
-pytest tests/test_vad.py -v && ruff check agent tests && pyright
-git add agent/audio/vad.py tests/test_vad.py
-git commit -m "feat(audio): Silero VAD wrapper for barge-in detection"
-```
-
----
-
-### Task 2.3: Cartesia TTS — buffered (IVR) and streaming (HUMAN) modes
-
-**Files:**
-- Create: `agent/audio/tts_buffered.py`, `agent/audio/tts_streaming.py`
-- Create: `tests/test_tts_chunking.py`
-
-- [ ] **Step 1: Implement `agent/audio/tts_buffered.py`**
-
+Wire into pipeline (`agent/pipeline/builder.py`):
 ```python
-"""Cartesia TTS — buffered mode: synthesize fully, then yield μ-law 8 kHz frames.
+from twilio.rest import Client
+from agent.pipeline.dtmf_processor import DTMFProcessor
 
-For short IVR utterances ("Jordan Mitchell", "yes"). Eliminates streaming-mid-tool-call
-foot-guns at the cost of full-synthesis latency before first audio out (~150-300 ms).
-"""
+twilio_client = Client(app.state.twilio_account_sid, app.state.twilio_auth_token)
+dtmf = DTMFProcessor(twilio_client, call_sid)
 
-from __future__ import annotations
-
-import os
-from collections.abc import Iterable, Iterator
-from typing import Protocol
-
-from agent.audio.transport import pcm16_to_mulaw8k
-
-
-_FRAME_BYTES = 160
-_MULAW_SILENCE = 0x7F
-
-
-class CartesiaClient(Protocol):
-    """Minimal protocol for the Cartesia client we depend on."""
-
-    def tts_pcm16(self, text: str, *, voice_id: str, sample_rate: int) -> bytes: ...
-
-
-def synthesize_to_mulaw_frames(
-    client: CartesiaClient, *, text: str, voice_id: str | None = None
-) -> Iterable[bytes]:
-    """Synthesize `text` and yield μ-law 8 kHz 20 ms frames."""
-    voice = voice_id or os.environ["CARTESIA_VOICE_ID"]
-    pcm = client.tts_pcm16(text, voice_id=voice, sample_rate=16_000)
-    mulaw = pcm16_to_mulaw8k(pcm, src_rate=16_000)
-    yield from chunk_mulaw_to_frames(mulaw)
-
-
-def chunk_mulaw_to_frames(audio: bytes) -> Iterator[bytes]:
-    """Slice `audio` into 160-byte frames, padding final with μ-law silence."""
-    for offset in range(0, len(audio), _FRAME_BYTES):
-        frame = audio[offset : offset + _FRAME_BYTES]
-        if len(frame) < _FRAME_BYTES:
-            frame = frame + bytes([_MULAW_SILENCE]) * (_FRAME_BYTES - len(frame))
-        yield frame
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    # StateMachineProcessor lands here in Phase 4
+    dtmf,        # consumes RestDTMFFrame from upstream
+    tts,
+    transport.output(),
+])
 ```
 
-- [ ] **Step 2: Implement `agent/audio/tts_streaming.py`**
-
-```python
-"""Cartesia TTS — streaming mode: synthesize chunk-by-chunk, yield frames as they arrive.
-
-For HUMAN-phase natural speech. First audible byte at ~150-200 ms; full first sentence
-in ~500-700 ms. Cancellation-safe — wraps the underlying SSE/WS in try/finally so
-asyncio.Task.cancel() leaves no partial frames in the outbound queue.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import os
-from collections.abc import AsyncIterable, AsyncIterator
-from typing import Protocol
-
-from agent.audio.transport import pcm16_to_mulaw8k
-
-
-_FRAME_BYTES = 160
-
-
-class CartesiaStreamingClient(Protocol):
-    """Cartesia streaming protocol — yields PCM16 16 kHz chunks per text token chunk."""
-
-    async def tts_pcm16_stream(
-        self, text_stream: AsyncIterable[str], *, voice_id: str, sample_rate: int
-    ) -> AsyncIterator[bytes]: ...
-
-
-async def stream_to_mulaw_frames(
-    client: CartesiaStreamingClient,
-    text_stream: AsyncIterable[str],
-    *,
-    voice_id: str | None = None,
-) -> AsyncIterator[bytes]:
-    """Stream `text_stream` through Cartesia and yield μ-law 8 kHz 20 ms frames.
-
-    Maintains a leftover buffer because PCM16 chunk boundaries don't align with
-    160-byte μ-law frames. On asyncio.CancelledError, the leftover is dropped
-    cleanly (try/finally on the underlying iterator).
-    """
-    voice = voice_id or os.environ["CARTESIA_VOICE_ID"]
-    leftover = b""
-    pcm_stream = client.tts_pcm16_stream(text_stream, voice_id=voice, sample_rate=16_000)
-    try:
-        async for pcm_chunk in pcm_stream:
-            mulaw = pcm16_to_mulaw8k(pcm_chunk, src_rate=16_000)
-            buf = leftover + mulaw
-            n_full = len(buf) // _FRAME_BYTES
-            for i in range(n_full):
-                yield buf[i * _FRAME_BYTES : (i + 1) * _FRAME_BYTES]
-            leftover = buf[n_full * _FRAME_BYTES :]
-        if leftover:
-            yield leftover + bytes([0x7F]) * (_FRAME_BYTES - len(leftover))
-    except asyncio.CancelledError:
-        # On cancellation: drop the leftover, stop yielding. Do NOT yield half a
-        # frame — Twilio will wedge.
-        raise
-```
-
-- [ ] **Step 3: Tests** (frame chunking, leftover handling, cancellation safety)
-
-```python
-"""Tests for TTS frame chunking and streaming."""
-
-from __future__ import annotations
-
-import asyncio
-from collections.abc import AsyncIterable, AsyncIterator
-
-import pytest
-
-from agent.audio.tts_buffered import chunk_mulaw_to_frames
-from agent.audio.tts_streaming import stream_to_mulaw_frames
-
-
-def test_chunking_8khz_20ms_frames() -> None:
-    audio = b"\x80" * 1600
-    frames = list(chunk_mulaw_to_frames(audio))
-    assert len(frames) == 10
-    assert all(len(f) == 160 for f in frames)
-
-
-def test_chunking_pads_partial_final_frame() -> None:
-    audio = b"\x80" * 250
-    frames = list(chunk_mulaw_to_frames(audio))
-    assert len(frames) == 2
-    assert len(frames[1]) == 160
-
-
-@pytest.mark.asyncio
-async def test_streaming_yields_complete_frames() -> None:
-    """Streaming with a fake client must yield only 160-byte frames."""
-
-    class FakeClient:
-        async def tts_pcm16_stream(
-            self, text_stream: AsyncIterable[str], *, voice_id: str, sample_rate: int
-        ) -> AsyncIterator[bytes]:
-            # Emit 2 chunks of arbitrary PCM16 size that don't line up to 160-byte μ-law
-            yield b"\x00\x00" * 2400  # 4800 bytes PCM16 16k → 800 bytes μ-law 8k
-            yield b"\x00\x00" * 1234
-
-        async def text_passthrough(self, src: AsyncIterable[str]) -> AsyncIterator[str]:
-            async for s in src:
-                yield s
-
-    async def text_iter() -> AsyncIterator[str]:
-        yield "hello"
-
-    client = FakeClient()
-    frames: list[bytes] = []
-    async for f in stream_to_mulaw_frames(client, text_iter()):
-        frames.append(f)
-    assert all(len(f) == 160 for f in frames)
-
-
-@pytest.mark.asyncio
-async def test_streaming_cancellation_clean() -> None:
-    """Cancelling the stream task must propagate CancelledError, not leak."""
-
-    class HangingClient:
-        async def tts_pcm16_stream(
-            self, text_stream: AsyncIterable[str], *, voice_id: str, sample_rate: int
-        ) -> AsyncIterator[bytes]:
-            await asyncio.sleep(10)
-            yield b""
-
-    async def text_iter() -> AsyncIterator[str]:
-        yield "hello"
-
-    async def consume() -> None:
-        async for _ in stream_to_mulaw_frames(HangingClient(), text_iter()):
-            pass
-
-    task = asyncio.create_task(consume())
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-```
-
-- [ ] **Step 4: Run + commit**
-
-```bash
-pytest tests/test_tts_chunking.py -v && ruff check agent tests && pyright
-git add agent/audio/ tests/test_tts_chunking.py
-git commit -m "feat(audio): Cartesia TTS — buffered (IVR) and streaming (HUMAN) with cancellation"
-```
-
----
-
-### Task 2.4: DTMF emitter — Twilio REST sendDigits side-channel
-
-**Files:**
-- Create: `agent/audio/dtmf.py`
-- Create: `tests/test_dtmf.py`
-
-(Same as old plan Task 2.3 — `send_dtmf(client, call_sid, digits)` via `<Play digits>` TwiML update. Note in code the foot-gun: Twilio may reset the `<Connect><Stream>` on TwiML update; verify in Phase 4 real call.)
+Commit: `feat(pipeline): DTMFProcessor for out-of-band DTMF via Twilio REST`.
 
 ---
 
@@ -2024,118 +2044,17 @@ git commit -m "feat(graph): builder skeleton + router with stubbed nodes"
 
 ---
 
-## Phase 4 — IVR mode
+## Phase 4 — IVR mode (StateMachineProcessor + LangGraph IVR nodes)
 
-Goal: real IVR turn works through the graph. Phase ends with REAL CALL CHECKPOINT 2.
+Goal: real IVR turn works end-to-end through the Pipecat pipeline + StateMachineProcessor + LangGraph. Phase ends with REAL CALL CHECKPOINT 2.
 
-### Task 4.1: ivr_llm node — invoke Cerebras with forced tool choice
+### Task 4.1: `ivr_llm` node (with deterministic Prompt-5 verification)
 
 **Files:**
-- Replace: `agent/graph/nodes/ivr_llm.py`
+- Replace stub: `agent/graph/nodes/ivr_llm.py`
 - Create: `tests/test_ivr_llm_node.py`
 
-- [ ] **Step 1: Write failing test (mock LLM, verify state update)**
-
-```python
-"""Tests for the ivr_llm node."""
-
-from __future__ import annotations
-
-import json
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage
-
-from agent.graph.nodes.ivr_llm import _ivr_llm_impl
-from agent.types import Order
-
-
-@pytest.fixture
-def order() -> Order:
-    data = json.loads(
-        (Path(__file__).parent.parent / "fixtures" / "orders" / "example.json").read_text()
-    )
-    return Order.model_validate(data)
-
-
-@pytest.mark.asyncio
-async def test_ivr_llm_appends_transcript_and_response(order: Order) -> None:
-    fake_chat = MagicMock()
-    fake_chat.ainvoke = AsyncMock(
-        return_value=AIMessage(content="", tool_calls=[
-            {"name": "send_dtmf", "args": {"digits": "1"}, "id": "call_123"}
-        ])
-    )
-    state = {
-        "mode": "ivr",
-        "order": order,
-        "new_transcript": "Press 1 for delivery.",
-        "ivr_messages": [],
-        "human_messages": [],
-        "pending_actions": [],
-        "hangup_reason": None,
-    }
-    update = await _ivr_llm_impl(state, chat=fake_chat)
-    msgs = update["ivr_messages"]
-    assert len(msgs) == 2
-    assert isinstance(msgs[0], HumanMessage)
-    assert msgs[0].content == "Press 1 for delivery."
-    assert msgs[1].tool_calls[0]["name"] == "send_dtmf"
-
-
-@pytest.mark.asyncio
-async def test_preface_content_does_not_leak_to_speak(order: Order) -> None:
-    """If the model emits content alongside a tool call, only the tool call dispatches."""
-    fake_chat = MagicMock()
-    fake_chat.ainvoke = AsyncMock(
-        return_value=AIMessage(
-            content="Sure! Dialing now.",  # preface text — must be ignored downstream
-            tool_calls=[
-                {"name": "send_dtmf", "args": {"digits": "1"}, "id": "call_x"}
-            ],
-        )
-    )
-    state = {
-        "mode": "ivr",
-        "order": order,
-        "new_transcript": "Press 1 for delivery.",
-        "ivr_messages": [],
-        "human_messages": [],
-        "pending_actions": [],
-        "hangup_reason": None,
-    }
-    # ivr_llm only appends history; the preface ends up in ivr_messages but
-    # ivr_tools dispatches by tool_calls only — content is never spoken.
-    update = await _ivr_llm_impl(state, chat=fake_chat)
-    last = update["ivr_messages"][-1]
-    assert last.tool_calls[0]["name"] == "send_dtmf"
-    # The preface stays in history (for debugging) but produces no SpeakAction
-    # — assertion of that is in test_ivr_tools_node.py.
-
-
-@pytest.mark.asyncio
-async def test_prompt5_deterministic_no_when_readback_wrong(order: Order) -> None:
-    """Prompt-5 readback verification short-circuits to 'no' on data mismatch."""
-    from agent.graph.nodes.ivr_llm import deterministic_confirm_response
-
-    # Wrong zip — readback says 90210 but order says 78745
-    transcript = "I heard Jordan Mitchell, 5125550147, zip code 90210. Is that correct?"
-    decision = deterministic_confirm_response(transcript, order)
-    assert decision == "no"
-
-
-@pytest.mark.asyncio
-async def test_prompt5_deterministic_yes_when_readback_correct(order: Order) -> None:
-    transcript = "I heard Jordan Mitchell, 5125550147, zip code 78745. Is that correct?"
-    decision = deterministic_confirm_response(transcript, order)
-    assert decision == "yes"
-```
-
-- [ ] **Step 2: Implement `agent/graph/nodes/ivr_llm.py`**
-
-> **Prompt-5 deterministic verification:** before invoking the LLM, if the transcript looks like a confirmation prompt with a readback ("I heard X, Y, zip code Z. Is that correct?"), regex-extract the readback fields and compare against `order.customer_name` / `order.phone_number` / `order.delivery_zip` deterministically. If any field mismatches, short-circuit to `say_short("no")` without calling the LLM. This avoids the known LLM failure mode where models lazily say "yes" on confirmation prompts. The LLM still handles the *recognition* of the confirm prompt; the *decision* is mechanical.
+> **Prompt-5 deterministic verification:** before invoking the LLM, if the transcript looks like a confirmation prompt with a readback ("I heard X, Y, zip code Z. Is that correct?"), regex-extract the readback fields and compare against `order.customer_name` / `order.phone_number` / `order.delivery_zip` deterministically. If any field mismatches, short-circuit to `say_short("no")` without calling the LLM. Avoids the known LLM failure mode where models lazily say "yes" on confirmation prompts.
 
 ```python
 """ivr_llm node: forced tool-call response on each finalized IVR transcript.
@@ -2170,31 +2089,23 @@ _CONFIRM_RE = re.compile(
 
 
 def deterministic_confirm_response(transcript: str, order: Order) -> Literal["yes", "no"] | None:
-    """If `transcript` is a Prompt-5 readback, return 'yes'/'no' deterministically.
-
-    Returns None if the transcript doesn't match the readback shape — caller
-    falls through to the LLM.
-    """
+    """If `transcript` is a Prompt-5 readback, return 'yes'/'no' deterministically."""
     match = _CONFIRM_RE.search(transcript)
     if not match:
         return None
     heard_name = match.group("name").strip().lower()
     heard_phone = re.sub(r"\D", "", match.group("phone"))
     heard_zip = match.group("zip")
-
     name_ok = heard_name == order.customer_name.lower()
     phone_ok = heard_phone == order.phone_number
     zip_ok = heard_zip == order.delivery_zip
-
     return "yes" if (name_ok and phone_ok and zip_ok) else "no"
 
 
 async def ivr_llm(state: AgentState) -> dict[str, Any]:
     """ivr_llm node — public entry point used by LangGraph."""
-    # Deterministic short-circuit for confirmation prompts
     confirm = deterministic_confirm_response(state["new_transcript"], state["order"])
     if confirm is not None:
-        # Synthesize an AIMessage with the appropriate tool call; bypass LLM
         synthetic = AIMessage(
             content="",
             tool_calls=[{
@@ -2230,108 +2141,17 @@ async def _ivr_llm_impl(state: AgentState, *, chat: "RunnableSerializable") -> d
     return {"ivr_messages": [user, response]}
 ```
 
-- [ ] **Step 3: Run + commit**
+Tests (mock chat client): forced-tool, deterministic confirm yes/no, preface-content drop. See plan section "test_ivr_llm_node.py" below or use the implementer's discretion to mirror the patterns documented in the spec.
 
-```bash
-pytest tests/test_ivr_llm_node.py -v && ruff check agent tests && pyright
-git add agent/graph/nodes/ivr_llm.py tests/test_ivr_llm_node.py
-git commit -m "feat(graph/ivr): ivr_llm node — forced tool call on each transcript"
-```
+Commit: `feat(graph/ivr): ivr_llm node — forced tool call + deterministic Prompt-5`.
 
----
-
-### Task 4.2: ivr_tools node — translate tool calls into Actions
+### Task 4.2: `ivr_tools` node (with `ToolMessage` acks)
 
 **Files:**
-- Replace: `agent/graph/nodes/ivr_tools.py`
+- Replace stub: `agent/graph/nodes/ivr_tools.py`
 - Create: `tests/test_ivr_tools_node.py`
 
-- [ ] **Step 1: Write failing test**
-
-```python
-"""Tests for the ivr_tools node: tool call → Action mapping."""
-
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-import pytest
-from langchain_core.messages import AIMessage
-
-from agent.graph.nodes.ivr_tools import ivr_tools
-from agent.graph.state import DTMFAction, SpeakAction, TransitionAction
-from agent.types import Order
-
-
-@pytest.fixture
-def order() -> Order:
-    return Order.model_validate(
-        json.loads(
-            (Path(__file__).parent.parent / "fixtures" / "orders" / "example.json").read_text()
-        )
-    )
-
-
-def _state_with(tool_call: dict, order: Order) -> dict:
-    return {
-        "mode": "ivr",
-        "order": order,
-        "new_transcript": "",
-        "ivr_messages": [
-            AIMessage(content="", tool_calls=[tool_call]),
-        ],
-        "human_messages": [],
-        "pending_actions": [],
-        "hangup_reason": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_send_dtmf_yields_dtmf_action(order: Order) -> None:
-    state = _state_with({"name": "send_dtmf", "args": {"digits": "1"}, "id": "x"}, order)
-    update = await ivr_tools(state)
-    assert update["pending_actions"][0] == DTMFAction(digits="1")
-
-
-@pytest.mark.asyncio
-async def test_say_short_yields_buffered_speak_action(order: Order) -> None:
-    state = _state_with({"name": "say_short", "args": {"text": "yes"}, "id": "x"}, order)
-    update = await ivr_tools(state)
-    a = update["pending_actions"][0]
-    assert isinstance(a, SpeakAction)
-    assert a.text == "yes"
-    assert a.streaming is False
-
-
-@pytest.mark.asyncio
-async def test_mark_transferred_sets_mode_hold(order: Order) -> None:
-    state = _state_with(
-        {"name": "mark_transferred_to_hold", "args": {}, "id": "x"}, order
-    )
-    update = await ivr_tools(state)
-    assert update["mode"] == "hold"
-    assert TransitionAction(target_mode="hold") in update["pending_actions"]
-
-
-@pytest.mark.asyncio
-async def test_no_tool_calls_no_actions(order: Order) -> None:
-    state = {
-        "mode": "ivr",
-        "order": order,
-        "new_transcript": "",
-        "ivr_messages": [AIMessage(content="oops", tool_calls=[])],
-        "human_messages": [],
-        "pending_actions": [],
-        "hangup_reason": None,
-    }
-    update = await ivr_tools(state)
-    assert update.get("pending_actions", []) == []
-```
-
-- [ ] **Step 2: Implement `agent/graph/nodes/ivr_tools.py`**
-
-> **Critical**: append a `ToolMessage` per tool call to `ivr_messages`. Without this, Cerebras (OpenAI-compatible API) will 400 on the next turn because the prior `AIMessage.tool_calls` has no matching tool response. Synthetic content `"ok"` is fine — the model never reads it; the protocol just requires the message exist.
+> **Critical:** append a `ToolMessage(content="ok", tool_call_id=call_id)` per tool call to `ivr_messages`. Without this, Cerebras (OpenAI-compatible API) will 400 on the next turn because the prior `AIMessage.tool_calls` has no matching tool response.
 
 ```python
 """ivr_tools node: read latest AIMessage's tool_calls, emit Actions, ack with ToolMessage."""
@@ -2364,56 +2184,55 @@ async def ivr_tools(state: AgentState) -> dict[str, Any]:
                 elif name == "mark_transferred_to_hold":
                     actions.append(TransitionAction(target_mode="hold"))
                     new_mode = "hold"
-                # Required by Cerebras (OpenAI-compat): every tool_call needs a
-                # matching ToolMessage with the same id, or the next turn 400s.
                 tool_acks.append(ToolMessage(content="ok", tool_call_id=call_id))
             break
 
     update: dict[str, Any] = {"pending_actions": actions}
     if tool_acks:
-        update["ivr_messages"] = tool_acks  # add_messages reducer appends
+        update["ivr_messages"] = tool_acks
     if new_mode is not None:
         update["mode"] = new_mode
     return update
 ```
 
-- [ ] **Step 3: Run + commit**
+Commit: `feat(graph/ivr): ivr_tools translates tool calls to Actions with ToolMessage acks`.
 
-```bash
-pytest tests/test_ivr_tools_node.py -v && ruff check agent tests && pyright
-git add agent/graph/nodes/ivr_tools.py tests/test_ivr_tools_node.py
-git commit -m "feat(graph/ivr): ivr_tools translates tool calls to Actions, sets mode on transfer"
-```
-
----
-
-### Task 4.3: StateProcessor adapter — bridge audio pipeline ↔ graph
+### Task 4.3: `StateMachineProcessor` (enqueue-and-drain FrameProcessor)
 
 **Files:**
-- Create: `agent/adapter.py`
-- Modify: `agent/server.py` to instantiate the adapter on /stream WS connect
+- Create: `agent/pipeline/state_machine_processor.py`
+- Create: `tests/test_state_machine_processor.py`
 
-- [ ] **Step 1: Implement `agent/adapter.py`**
+This is the bridge between Pipecat (audio frames) and LangGraph (state machine). It lives INSIDE the Pipecat pipeline as a `FrameProcessor` subclass; the compiled graph runs OUTSIDE Pipecat.
 
-This is the central runtime piece — translates audio events into `graph.ainvoke`s and dispatches resulting Actions.
+**Design (per senior review):**
+- `process_frame()` returns immediately after enqueueing a `TranscriptionFrame` — does NOT await the LLM. This avoids backpressuring upstream STT.
+- A separate drain task consumes the inbound queue serially, calls `graph.ainvoke()`, and pushes outbound `Action`s as Pipecat frames.
+- An `InterruptionFrame` from upstream cancels the in-flight LLM task (barge-in).
+- The processor holds the `call_sid` for `thread_id` plumbing (set on the `start` event in Phase 1.6 builder).
 
 ```python
-"""StateProcessor: bridges the audio pipeline to the LangGraph state machine.
+"""StateMachineProcessor: bridges Pipecat audio events to a LangGraph state machine.
 
-For each finalized ASR transcript (or audio event during HOLD), invokes the
-graph and dispatches the resulting Actions back to the audio pipeline.
+The processor lives INSIDE the Pipecat pipeline as a FrameProcessor. The compiled
+LangGraph graph runs OUTSIDE Pipecat — the processor calls `graph.ainvoke()` from
+a drain task that consumes an inbound queue. This non-blocking pattern avoids
+backpressuring upstream STT while still serializing graph invocations per call.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from agent.audio.dtmf import send_dtmf
-from agent.audio.tts_buffered import synthesize_to_mulaw_frames
-from agent.audio.tts_streaming import stream_to_mulaw_frames
+from pipecat.frames.frames import (
+    Frame,
+    InterruptionFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
 from agent.graph.state import (
     Action,
     AgentState,
@@ -2422,40 +2241,27 @@ from agent.graph.state import (
     SpeakAction,
     TransitionAction,
 )
-from agent.obs import build_logger, langfuse_callback_handler
-from agent.runtime.stream import OutboundFrame, encode_outbound_frame
-from agent.types import Order, Outcome
-
-if TYPE_CHECKING:
-    from cartesia import Cartesia
-    from fastapi import WebSocket
-    from twilio.rest import Client
+from agent.pipeline.frames import RestDTMFFrame
+from agent.types import Order
 
 
-_log = build_logger(__name__)
+class StateMachineProcessor(FrameProcessor):
+    """Bridge Pipecat ↔ LangGraph. Enqueue-and-drain pattern.
 
+    - `process_frame` is non-blocking: enqueue and return so upstream isn't
+      backpressured.
+    - A drain task consumes the inbound queue serially, awaits
+      `graph.ainvoke()`, and pushes resulting Action frames downstream.
+    - On `InterruptionFrame` (barge-in), the in-flight LLM task is cancelled.
+    """
 
-class StateProcessor:
-    """One per call. Owns the graph invocation loop and audio dispatch."""
-
-    def __init__(
-        self,
-        *,
-        ws: WebSocket,
-        twilio: Client,
-        cartesia: Cartesia,
-        order: Order,
-        graph: Any,
-    ) -> None:
-        self.ws = ws
-        self.twilio = twilio
-        self.cartesia = cartesia
-        self.order = order
-        self.graph = graph
-        self.call_sid: str | None = None
-        self.stream_sid: str | None = None
-        self.tts_task: asyncio.Task[None] | None = None
-        self.hold_timeout_task: asyncio.Task[None] | None = None
+    def __init__(self, *, graph: Any, order: Order, call_sid: str) -> None:
+        super().__init__()
+        self._graph = graph
+        self._call_sid = call_sid
+        self._inbound_q: asyncio.Queue[TranscriptionFrame] = asyncio.Queue()
+        self._drain_task: asyncio.Task[None] | None = None
+        self._llm_task: asyncio.Task[None] | None = None
         self._state: AgentState = {  # type: ignore[typeddict-item]
             "mode": "ivr",
             "order": order,
@@ -2465,264 +2271,124 @@ class StateProcessor:
             "pending_actions": [],
             "hangup_reason": None,
         }
-        self._mark_events: dict[str, asyncio.Event] = {}
 
-    async def on_call_started(self, *, call_sid: str, stream_sid: str) -> None:
-        """Initialize per-call state."""
-        self.call_sid = call_sid
-        self.stream_sid = stream_sid
+    async def setup(self, *args: Any, **kwargs: Any) -> None:
+        """Start the drain task when the pipeline boots."""
+        await super().setup(*args, **kwargs)
+        self._drain_task = asyncio.create_task(self._drain())
 
-    async def on_transcript(self, transcript: str) -> None:
-        """Process one finalized ASR transcript by invoking the graph."""
-        self._state["new_transcript"] = transcript
-        await self._invoke_graph()
-
-    async def on_barge_in(self) -> None:
-        """User started speaking — cancel any in-flight TTS task."""
-        if self.tts_task is not None and not self.tts_task.done():
-            self.tts_task.cancel()
+    async def cleanup(self) -> None:
+        """Cancel drain + in-flight LLM tasks on pipeline teardown."""
+        if self._llm_task is not None and not self._llm_task.done():
+            self._llm_task.cancel()
+        if self._drain_task is not None and not self._drain_task.done():
+            self._drain_task.cancel()
             try:
-                await self.tts_task
+                await self._drain_task
             except asyncio.CancelledError:
                 pass
+        await super().cleanup()
 
-    async def on_hold_timeout(self) -> None:
-        """Hold-timeout watchdog fired."""
-        self._state["mode"] = "done"
-        self._state["hangup_reason"] = Outcome.HOLD_TIMEOUT
-        await self._invoke_graph()
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Non-blocking dispatch. Enqueue transcripts; cancel LLM on interruption."""
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            await self._inbound_q.put(frame)
+            return  # consumed — drain task drives the response
+        if isinstance(frame, InterruptionFrame) and self._llm_task is not None:
+            if not self._llm_task.done():
+                self._llm_task.cancel()
+        await self.push_frame(frame, direction)
 
-    async def _invoke_graph(self) -> None:
-        if self.call_sid is None:
-            return
-        config = {
-            "configurable": {"thread_id": self.call_sid},
-            "callbacks": [cb] if (cb := langfuse_callback_handler()) else [],
-        }
-        result: AgentState = await self.graph.ainvoke(self._state, config=config)
-        # Merge new state from result
+    async def _drain(self) -> None:
+        """Consume the inbound queue serially; run one graph turn per transcript."""
+        while True:
+            tframe = await self._inbound_q.get()
+            self._state["new_transcript"] = tframe.text
+            self._llm_task = asyncio.create_task(self._run_graph_turn())
+            try:
+                await self._llm_task
+            except asyncio.CancelledError:
+                continue  # barge-in cancelled this turn; wait for next utterance
+
+    async def _run_graph_turn(self) -> None:
+        """One graph invocation; dispatch resulting Actions as Pipecat frames."""
+        config = {"configurable": {"thread_id": self._call_sid}}
+        result: AgentState = await self._graph.ainvoke(self._state, config=config)
         self._state = result
-        # Dispatch any pending actions
         for action in result.get("pending_actions", []):
             await self._dispatch(action)
-        # Clear actions
         self._state["pending_actions"] = []
 
     async def _dispatch(self, action: Action) -> None:
+        """Translate an Action to a Pipecat frame and push downstream."""
         if isinstance(action, DTMFAction):
-            assert self.call_sid is not None
-            send_dtmf(self.twilio, call_sid=self.call_sid, digits=action.digits)
-            _log.info("dispatched_dtmf", extra={
-                "call_sid": self.call_sid, "mode": self._state["mode"],
-                "event": "dtmf_sent", "digits": action.digits,
-            })
+            await self.push_frame(RestDTMFFrame(digits=action.digits), FrameDirection.DOWNSTREAM)
         elif isinstance(action, SpeakAction):
-            await self._speak(action)
+            await self.push_frame(TTSSpeakFrame(text=action.text), FrameDirection.DOWNSTREAM)
         elif isinstance(action, TransitionAction):
-            await self._on_transition(action.target_mode)
+            # Mode transition recorded in self._state; no outbound frame.
+            pass
         elif isinstance(action, EndCallAction):
-            await self._end_call(action)
-
-    async def _speak(self, action: SpeakAction) -> None:
-        if self.stream_sid is None:
-            return
-        if self.tts_task is not None:
-            self.tts_task.cancel()
-            try:
-                await self.tts_task
-            except asyncio.CancelledError:
-                pass
-        if action.streaming:
-            self.tts_task = asyncio.create_task(self._speak_streaming(action.text))
-        else:
-            self.tts_task = asyncio.create_task(self._speak_buffered(action.text))
-
-    async def _speak_buffered(self, text: str) -> None:
-        if self.stream_sid is None:
-            return
-        for frame in synthesize_to_mulaw_frames(self.cartesia, text=text):
-            out = OutboundFrame(stream_sid=self.stream_sid, audio=frame)
-            await self.ws.send_text(encode_outbound_frame(out))
-
-    async def _speak_streaming(self, text: str) -> None:
-        # Stub: in HUMAN mode, the LLM streaming output drives this path.
-        # See Phase 6 — the human_llm node returns a token stream that we plumb
-        # through Cartesia streaming. For Phase 4, this isn't reached.
-        raise NotImplementedError("filled in Phase 6")
-
-    async def _on_transition(self, target_mode: str) -> None:
-        self._state["mode"] = target_mode  # type: ignore[typeddict-item]
-        if target_mode == "hold":
-            # Start hold-timeout watchdog
-            self.hold_timeout_task = asyncio.create_task(self._hold_timeout_watch())
-
-    async def _hold_timeout_watch(self) -> None:
-        await asyncio.sleep(300)  # 5 min
-        if self._state["mode"] == "hold":
-            await self.on_hold_timeout()
-
-    async def _end_call(self, action: EndCallAction) -> None:
-        # Wait for any in-flight TTS to drain (the synthesis task ending != Twilio
-        # finished playing). Send a Twilio Media Streams `mark` event after the
-        # last audio frame and wait for Twilio to echo it back — that's the
-        # signal that audio has actually played out, not just been queued.
-        if self.tts_task is not None and not self.tts_task.done():
-            try:
-                await asyncio.wait_for(self.tts_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                self.tts_task.cancel()
-        if self.stream_sid is not None:
-            mark_name = f"end_{action.outcome.value}"
-            await self.ws.send_text(json.dumps({
-                "event": "mark",
-                "streamSid": self.stream_sid,
-                "mark": {"name": mark_name},
-            }))
-            # Wait for Twilio to echo the mark (consumed by the WS handler in
-            # server.py and forwarded via on_mark_received). Bound to 3s so a
-            # stuck Twilio doesn't hang shutdown.
-            try:
-                await asyncio.wait_for(self._mark_echoed(mark_name), timeout=3.0)
-            except asyncio.TimeoutError:
-                pass
-        # Print final JSON
-        print(json.dumps(action.json_payload))
-        # Twilio hangup
-        if self.call_sid is not None:
-            try:
-                self.twilio.calls(self.call_sid).update(status="completed")
-            except Exception:  # noqa: BLE001 — best effort
-                pass
-
-    async def _mark_echoed(self, name: str) -> None:
-        """Wait until on_mark_received(name) sets the corresponding event."""
-        ev = self._mark_events.setdefault(name, asyncio.Event())
-        await ev.wait()
-
-    async def on_mark_received(self, name: str) -> None:
-        """Called by the WS handler when Twilio echoes a mark event back."""
-        ev = self._mark_events.setdefault(name, asyncio.Event())
-        ev.set()
-
-    async def close(self) -> None:
-        for task in (self.tts_task, self.hold_timeout_task):
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # Outbound JSON + Twilio hangup wired in Phase 7 done_node.
+            pass
 ```
 
-- [ ] **Step 2: Lint + commit**
+Tests (mock the graph; assert process_frame returns fast, drain serializes, LLM cancellation on InterruptionFrame, RestDTMFFrame pushed for DTMFAction).
 
-```bash
-ruff check agent && pyright
-git add agent/adapter.py
-git commit -m "feat(adapter): StateProcessor bridges audio pipeline ↔ LangGraph"
-```
+Commit: `feat(pipeline): StateMachineProcessor — non-blocking bridge to LangGraph`.
 
----
-
-### Task 4.3b: WebSocket handler — Twilio Media Streams ↔ Deepgram + adapter
-
-This is the audio-pipeline glue. Without it, no audio reaches the graph and no IVR call happens. (Senior review flagged the previous "described, not coded" version as a blocker — promoted here.)
+### Task 4.4: Wire `StateMachineProcessor` into the Pipecat pipeline
 
 **Files:**
-- Modify: `agent/server.py` (replace echo handler from T1.4)
-
-- [ ] **Step 1: Replace the echo `/stream` handler in `agent/server.py`**
+- Modify: `agent/pipeline/builder.py`
 
 ```python
-@app.websocket("/stream")
-async def stream(ws: WebSocket) -> None:
-    """Twilio Media Streams handler: route audio to ASR + adapter, dispatch outbound."""
-    from agent.adapter import StateProcessor
-    from agent.asr import DeepgramStream
-    from agent.graph.builder import build_graph
-    from agent.runtime.stream import decode_inbound_frame
+# In agent/pipeline/builder.py (extending Phase 2):
+from agent.graph.builder import build_graph
+from agent.pipeline.state_machine_processor import StateMachineProcessor
 
-    await ws.accept()
-    order: Order = ws.app.state.order
-    twilio: Client = ws.app.state.twilio
-    cartesia: Cartesia = ws.app.state.cartesia
-    graph = build_graph()
+graph = build_graph()  # compiled with MemorySaver checkpointer
+state_machine = StateMachineProcessor(
+    graph=graph,
+    order=app.state.order,
+    call_sid=call_sid,
+)
 
-    deepgram = DeepgramStream()
-    processor = StateProcessor(
-        ws=ws, twilio=twilio, cartesia=cartesia, order=order, graph=graph
-    )
-    finals_task: asyncio.Task[None] | None = None
-    errors_task: asyncio.Task[None] | None = None
-
-    async def _consume_finals() -> None:
-        async for transcript in deepgram.finals():
-            await processor.on_transcript(transcript)
-
-    async def _consume_errors() -> None:
-        async for err in deepgram.errors():
-            # Treat ASR errors as ivr_failed during IVR; adapter routes via hangup_reason.
-            await processor.on_asr_error(err)
-
-    try:
-        await deepgram.open(utterance_end_ms=750)  # IVR-tuned per senior review
-        finals_task = asyncio.create_task(_consume_finals())
-        errors_task = asyncio.create_task(_consume_errors())
-
-        while True:
-            msg = await ws.receive_text()
-            frame = decode_inbound_frame(msg)
-            if frame is None:
-                continue
-            if frame.kind == "start" and frame.stream_sid and frame.call_sid:
-                await processor.on_call_started(
-                    call_sid=frame.call_sid, stream_sid=frame.stream_sid
-                )
-            elif frame.kind == "media":
-                await deepgram.send(frame.audio)
-            elif frame.kind == "stop":
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        for task in (finals_task, errors_task):
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        await deepgram.close()
-        await processor.close()
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    state_machine,   # bridge to LangGraph
+    dtmf,            # DTMFProcessor consumes RestDTMFFrame
+    tts,             # CartesiaTTSService consumes TTSSpeakFrame
+    transport.output(),
+])
 ```
 
-- [ ] **Step 2: Add `on_asr_error` method to StateProcessor** in `agent/adapter.py`:
+Commit: `feat(pipeline): wire StateMachineProcessor between STT and DTMF/TTS`.
 
-```python
-async def on_asr_error(self, err: Exception) -> None:
-    """Handle a fatal Deepgram ASR error during IVR by triggering ivr_failed."""
-    if self._state["mode"] == "ivr":
-        self._state["mode"] = "done"
-        self._state["hangup_reason"] = Outcome.IVR_FAILED
-        await self._invoke_graph()
-```
+### Task 4.5: REAL CALL CHECKPOINT 2 — IVR navigation works end-to-end
 
-- [ ] **Step 3: Lint + commit**
+Manual checkpoint:
 
-```bash
-ruff check agent && pyright
-git add agent/server.py agent/adapter.py
-git commit -m "feat(server): WS handler wires Twilio Media Streams ↔ Deepgram ↔ StateProcessor"
-```
+1. Place a call: `python -m agent.cli fixtures/orders/example.json --to +1YOURPHONE`
+2. Read the IVR script in robotic monotone:
+   - "Thank you for calling. Press 1 for delivery..." → expect DTMF `1`
+   - "Please say the name for the order." → expect agent says "Jordan Mitchell"
+   - "Please enter your 10-digit callback number." → expect DTMF `5125550147`
+   - "Please say your delivery zip code." → expect agent says "78745"
+   - "I heard Jordan Mitchell, 5125550147, zip code 78745. Is that correct?" → expect "yes"
+   - "Got it. Please hold..." → expect agent goes silent (mode → hold)
+3. Verify:
+   - Each IVR response is exactly one tool dispatch (no extra speech)
+   - DTMF tones audibly reach the call (confirm mid-stream behavior from T1.9)
+   - Mode transition logged when "please hold" matched
+   - No exceptions on hangup
+4. If Prompt-5 readback fails (synthetic_no fires when readback mismatches): verify the readback was actually wrong; the deterministic verification is working.
+
+Commit any fixes before moving to Phase 5.
 
 ---
-
-### Task 4.4: REAL CALL CHECKPOINT 2 — IVR navigation works end-to-end
-
-(Same script as old plan Task 2.7. Read the IVR prompts in robotic monotone; verify each tool dispatch produces the right action; verify mode→hold transition.)
-
----
-
 ## Phase 5 — HOLD mode
 
 ### Task 5.1: Energy gate (audio-frame-level)
@@ -2776,7 +2442,7 @@ async def hold_node(state: AgentState) -> dict[str, Any]:
 
 ### Task 5.3: Wire energy gate into adapter (HOLD mode handling)
 
-In `StateProcessor.on_media` (or its equivalent in the audio pipeline), during HOLD mode: feed PCM16 16 kHz to the energy gate. Only forward transcripts to `on_transcript` when the gate has tripped.
+In `StateMachineProcessor` (the Pipecat `FrameProcessor` subclass), during HOLD mode: feed audio frames to the energy gate (likely as a separate processor upstream of STT, OR by intercepting `AudioRawFrame` in `process_frame` before enqueueing). Only forward transcripts to the inbound queue when the gate has tripped.
 
 ### Task 5.4: REAL CALL CHECKPOINT 3 — hold detection works
 

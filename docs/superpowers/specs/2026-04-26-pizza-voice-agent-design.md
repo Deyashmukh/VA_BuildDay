@@ -376,13 +376,27 @@ agent/
     └── result.py              # CallResult schema (output)
 ```
 
-**Pipecat services we use directly** (no wrapping):
-- `pipecat.transports.network.fastapi_websocket.FastAPIWebsocketTransport`
+**Pipecat services we use directly** (no wrapping; canonical paths for `pipecat-ai==0.0.108`):
+- `pipecat.transports.websocket.fastapi.FastAPIWebsocketTransport` (NOT the deprecated `transports.network.fastapi_websocket`)
 - `pipecat.serializers.twilio.TwilioFrameSerializer`
 - `pipecat.audio.vad.silero.SileroVADAnalyzer`
 - `pipecat.services.deepgram.stt.DeepgramSTTService`
 - `pipecat.services.cartesia.tts.CartesiaTTSService`
 - `pipecat.pipeline.pipeline.Pipeline` + `pipecat.pipeline.runner.PipelineRunner` + `pipecat.pipeline.task.PipelineTask`
+- `pipecat.processors.frame_processor.FrameProcessor` (base for our `StateMachineProcessor` and `DTMFProcessor`)
+- `pipecat.frames.frames.SystemFrame` (base for our `RestDTMFFrame`)
+
+## Post-pivot gaps (resolved)
+
+The Pipecat pivot left a few things implicit; this section pins them down explicitly.
+
+**1. Pipeline lifecycle on hangup.** `PipelineRunner.run(task)` returns when the pipeline ends (the transport detects the WebSocket close from Twilio's `stop` event). Wrap in `try/finally` and call `task.cancel()` on any exception to leave no zombie subprocesses. `handle_sigint=False` because the CLI manages its own signal handling — see `agent/pipeline/builder.py`.
+
+**2. Deepgram reopen for endpointing change.** `DeepgramSTTService` is constructed once per pipeline. `utterance_end_ms` is fixed at connect (Pipecat surfaces Deepgram's live-config limitation). To switch endpointing on `IVR → HOLD → HUMAN` transitions, we recreate the service AND rebuild the pipeline mid-call. For the IVR-only milestone, we pin `utterance_end_ms=750` (IVR-tuned). Phase 5/6 will document the rebuild mechanism (likely a new `PipelineTask` per mode boundary, with state replay via the LangGraph checkpointer).
+
+**3. Langfuse instrumentation placement.** Two options: a Pipecat `FrameObserver` that emits a span per frame, OR `langfuse_callback_handler()` passed to `graph.ainvoke()` config. We use the **callback handler approach** — one trace per call (named `call_<sid>`), one span per LangGraph node invocation. Pipecat-internal frames don't need spans; the LLM calls do. The `StateMachineProcessor` adds the callback to the `config` it passes to `graph.ainvoke`.
+
+**4. `call_sid` plumbing.** Twilio's `start` event (the first WS message) carries `call_sid`. The pipeline builder (`agent/pipeline/builder.py`) reads this BEFORE constructing `TwilioFrameSerializer`, then passes it to `StateMachineProcessor.__init__(..., call_sid=call_sid)`. The processor uses it as both the LangGraph `thread_id` (per-call state isolation) and the target SID for `DTMFProcessor`'s Twilio REST calls.
 
 ## Open Questions / Out-of-Scope for v1
 
